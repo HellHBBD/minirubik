@@ -8,7 +8,9 @@ enum {
     PERMUTATIONS = 5040,
     ORIENTATIONS = 729,
     STATES = PERMUTATIONS * ORIENTATIONS,
-    MOVES = 9
+    MOVES = 9,
+    MAX_DEPTH = 11,
+    HARDEST_STATES = 2644
 };
 
 typedef struct {
@@ -258,6 +260,115 @@ static uint8_t coordinate_heuristic(uint16_t p,
     return dp > dq ? dp : dq;
 }
 
+typedef struct {
+    uint16_t permutation[3][PERMUTATIONS];
+    uint16_t orientation[3][ORIENTATIONS];
+    uint8_t permutation_distance[PERMUTATIONS];
+    uint8_t orientation_distance[ORIENTATIONS];
+} coordinate_tables_t;
+
+static coordinate_tables_t query_tables;
+
+static int build_query_tables(void)
+{
+    uint16_t queue[PERMUTATIONS];
+    build_transitions(query_tables.permutation, query_tables.orientation);
+    return build_coordinate_distances(PERMUTATIONS, query_tables.permutation,
+                                      query_tables.permutation_distance, queue) &&
+           build_coordinate_distances(ORIENTATIONS, query_tables.orientation,
+                                      query_tables.orientation_distance, queue);
+}
+
+typedef struct {
+    uint16_t p, q;
+    uint8_t previous_face, next_move;
+} frame_t;
+
+/* Host diagnostics only. Counters are collected separately for each bound;
+ * a normal query passes NULL and produces only its solution line.
+ */
+typedef struct {
+    uint64_t expanded[MAX_DEPTH + 1];
+    uint64_t generated[MAX_DEPTH + 1];
+    uint64_t cutoffs[MAX_DEPTH + 1];
+    uint64_t same_face[MAX_DEPTH + 1];
+} search_stats_t;
+
+static int solve_coordinate(uint16_t p,
+                            uint16_t q,
+                            uint8_t path[MAX_DEPTH],
+                            search_stats_t *stats)
+{
+    frame_t frames[MAX_DEPTH + 1];
+    uint8_t initial = coordinate_heuristic(p, q,
+                                         query_tables.permutation_distance,
+                                         query_tables.orientation_distance);
+    for (uint8_t bound = initial; bound <= MAX_DEPTH; ++bound) {
+        uint8_t depth = 0;
+        /* Face 3 is the root sentinel: none of R/B/D is excluded. */
+        frames[0] = (frame_t) {p, q, 3, 0};
+        for (;;) {
+            frame_t *frame = &frames[depth];
+            if (frame->p == 0 && frame->q == 0)
+                return depth;
+            if (depth == bound || frame->next_move == MOVES) {
+                if (depth == 0)
+                    break;
+                --depth;
+                continue;
+            }
+            /* Expanded means a non-goal frame whose outgoing moves are
+             * examined. Count it only on its first visit, not on backtrack.
+             */
+            if (stats && frame->next_move == 0)
+                ++stats->expanded[bound];
+            uint8_t move = frame->next_move++;
+            uint8_t face = (uint8_t) (move / 3U);
+            if (face == frame->previous_face) {
+                if (stats)
+                    ++stats->same_face[bound];
+                continue;
+            }
+            uint16_t next_p = frame->p, next_q = frame->q;
+            for (uint8_t turn = 0; turn <= move % 3U; ++turn) {
+                next_p = query_tables.permutation[face][next_p];
+                next_q = query_tables.orientation[face][next_q];
+            }
+            if (stats)
+                ++stats->generated[bound];
+            uint8_t h = coordinate_heuristic(next_p, next_q,
+                                           query_tables.permutation_distance,
+                                           query_tables.orientation_distance);
+            if (depth + 1U + h > bound) {
+                if (stats)
+                    ++stats->cutoffs[bound];
+                continue;
+            }
+            /* The parent cursor was advanced before descent, so backtrack
+             * resumes at the next move. depth < bound <= MAX_DEPTH here.
+             */
+            path[depth] = move;
+            ++depth;
+            frames[depth] = (frame_t) {next_p, next_q, face, 0};
+        }
+    }
+    return -1;
+}
+
+static int replay_solution(state_t state,
+                           const uint8_t path[MAX_DEPTH],
+                           int length)
+{
+    if (length < 0 || length > MAX_DEPTH)
+        return 0;
+    for (int i = 0; i < length; ++i) {
+        if (path[i] >= MOVES)
+            return 0;
+        state = apply_move(state, path[i]);
+    }
+    return valid(&state) && rank_state(&state) == 0;
+}
+
 static uint8_t *build_table(uint8_t *diameter)
 {
     uint8_t *toward_solved = malloc(STATES);
@@ -395,25 +506,17 @@ static int self_test(void)
  */
 static int self_test_heuristic(const uint8_t *toward_solved)
 {
-    uint16_t permutation[3][PERMUTATIONS], orientation[3][ORIENTATIONS];
-    uint8_t permutation_distance[PERMUTATIONS];
-    uint8_t orientation_distance[ORIENTATIONS];
-    uint16_t queue[PERMUTATIONS];
     uint32_t gaps[12] = {0};
     uint8_t maximum = 0;
-    build_transitions(permutation, orientation);
-    if (!build_coordinate_distances(PERMUTATIONS, permutation,
-                                    permutation_distance, queue) ||
-        !build_coordinate_distances(ORIENTATIONS, orientation,
-                                    orientation_distance, queue))
-        return 0;
-    if (permutation_distance[0] != 0 || orientation_distance[0] != 0)
+    if (query_tables.permutation_distance[0] != 0 ||
+        query_tables.orientation_distance[0] != 0)
         return 0;
     for (uint32_t rank = 0; rank < STATES; ++rank) {
         uint16_t p = (uint16_t) (rank / ORIENTATIONS);
         uint16_t q = (uint16_t) (rank % ORIENTATIONS);
-        uint8_t h = coordinate_heuristic(p, q, permutation_distance,
-                                        orientation_distance);
+        uint8_t h = coordinate_heuristic(p, q,
+                                        query_tables.permutation_distance,
+                                        query_tables.orientation_distance);
         uint8_t distance = 0;
         uint32_t here = rank;
         state_t state;
@@ -443,6 +546,137 @@ static int self_test_heuristic(const uint8_t *toward_solved)
     return 1;
 }
 
+/* Obtain exact length by following the original oracle with the cubie model.
+ * Invalid moves and paths longer than the known diameter fail explicitly.
+ */
+static int oracle_distance(state_t state, const uint8_t *toward_solved)
+{
+    uint32_t rank = rank_state(&state);
+    int distance = 0;
+    while (rank) {
+        uint8_t move = toward_solved[rank];
+        if (move >= MOVES || distance == MAX_DEPTH)
+            return -1;
+        state = apply_move(state, move);
+        rank = rank_state(&state);
+        ++distance;
+    }
+    return distance;
+}
+
+static int check_search(state_t state,
+                        int expected,
+                        search_stats_t *stats)
+{
+    uint8_t path[MAX_DEPTH];
+    uint32_t rank = rank_state(&state);
+    int length = solve_coordinate((uint16_t) (rank / ORIENTATIONS),
+                                  (uint16_t) (rank % ORIENTATIONS), path, stats);
+    if (length != expected || !replay_solution(state, path, length)) {
+        fprintf(stderr, "search failed at rank %lu: expected %d, got %d\n",
+                (unsigned long) rank, expected, length);
+        return 0;
+    }
+    return 1;
+}
+
+static void print_search_stats(const search_stats_t *stats)
+{
+    for (uint8_t bound = 0; bound <= MAX_DEPTH; ++bound) {
+        if (stats->expanded[bound] || stats->generated[bound])
+            fprintf(stderr,
+                    "bound %u: expanded %llu; generated %llu; "
+                    "cutoffs %llu; same-face skips %llu\n",
+                    (unsigned) bound,
+                    (unsigned long long) stats->expanded[bound],
+                    (unsigned long long) stats->generated[bound],
+                    (unsigned long long) stats->cutoffs[bound],
+                    (unsigned long long) stats->same_face[bound]);
+    }
+}
+
+/* Basic mode covers all distance-0..2 states, the eight existing vectors,
+ * and deterministic ranks divisible by 65536. Hardest mode selects a range
+ * of the 2644 distance-11 states in ascending rank order for bounded batches.
+ */
+static int self_test_search(const uint8_t *toward_solved,
+                            int hardest,
+                            uint16_t first,
+                            uint16_t count)
+{
+    static const char *const vectors[] = {
+        "12345671111111", "62345713133111", "24316572122213",
+        "25713642221111", "24513763133333", "43752611332133",
+        "25416373331111", "21345671111111"
+    };
+    uint32_t vector_ranks[sizeof vectors / sizeof vectors[0]];
+    uint32_t checked = 0, hardest_seen = 0;
+    search_stats_t stats = {0};
+    state_t state;
+    for (size_t i = 0; i < sizeof vectors / sizeof vectors[0]; ++i) {
+        if (!parse_state(vectors[i], &state))
+            return 0;
+        vector_ranks[i] = rank_state(&state);
+    }
+    for (uint32_t rank = 0; rank < STATES; ++rank) {
+        unrank_state(rank, &state);
+        int distance = oracle_distance(state, toward_solved);
+        if (distance < 0)
+            return 0;
+        int selected = 0;
+        if (hardest) {
+            if (distance == MAX_DEPTH) {
+                selected = hardest_seen >= first &&
+                           hardest_seen < (uint32_t) first + count;
+                ++hardest_seen;
+            }
+        } else {
+            selected = distance <= 2 || rank % 65536U == 0;
+            for (size_t i = 0; i < sizeof vectors / sizeof vectors[0]; ++i)
+                if (rank == vector_ranks[i])
+                    selected = 1;
+        }
+        if (selected) {
+            if (!check_search(state, distance, &stats))
+                return 0;
+            ++checked;
+        }
+    }
+    if (hardest && (hardest_seen != HARDEST_STATES || checked != count))
+        return 0;
+    fprintf(stderr, "IDA* replay and exact length: %lu states checked",
+            (unsigned long) checked);
+    if (hardest)
+        fprintf(stderr, "; hardest indices [%u,%u)",
+                (unsigned) first, (unsigned) (first + count));
+    fputc('\n', stderr);
+    print_search_stats(&stats);
+    fprintf(stderr,
+            "query tables %lu bytes; frames %lu bytes; path %u bytes; "
+            "build queue %lu bytes\n",
+            (unsigned long) sizeof query_tables,
+            (unsigned long) ((MAX_DEPTH + 1) * sizeof(frame_t)),
+            (unsigned) MAX_DEPTH,
+            (unsigned long) (PERMUTATIONS * sizeof(uint16_t)));
+    return 1;
+}
+
+static int parse_test_number(const char *input, uint16_t *number)
+{
+    uint32_t value = 0;
+    if (!*input)
+        return 0;
+    for (; *input; ++input) {
+        if (*input < '0' || *input > '9')
+            return 0;
+        value = value * 10U + (unsigned) (*input - '0');
+        if (value > HARDEST_STATES)
+            return 0;
+    }
+    *number = (uint16_t) value;
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     state_t state;
@@ -462,13 +696,33 @@ int main(int argc, char **argv)
             fputs("BFS check failed\n", stderr);
             return 1;
         }
-        if (!self_test_heuristic(table)) {
+        if (!build_query_tables() || !self_test_heuristic(table) ||
+            !self_test_search(table, 0, 0, 0)) {
             free(table);
-            fputs("heuristic check failed\n", stderr);
+            fputs("coordinate solver check failed\n", stderr);
             return 1;
         }
         free(table);
         puts("3674160 states; diameter 11");
+        return output_failed();
+    }
+    if (argc == 4 && !strcmp(argv[1], "--search-test")) {
+        uint16_t first, count;
+        if (!parse_test_number(argv[2], &first) ||
+            !parse_test_number(argv[3], &count) || count == 0 ||
+            first + count > HARDEST_STATES) {
+            fputs("usage: solver --search-test FIRST COUNT\n", stderr);
+            return 2;
+        }
+        uint8_t *table = build_table(&diameter);
+        if (!table)
+            return 1;
+        int ok = diameter == MAX_DEPTH && build_query_tables() &&
+                 self_test_search(table, 1, first, count);
+        free(table);
+        if (!ok)
+            return 1;
+        puts("distance-11 batch passed");
         return output_failed();
     }
     if (argc != 2 || !parse_state(argv[1], &state)) {
@@ -477,19 +731,23 @@ int main(int argc, char **argv)
                 argc > 0 && argv[0] ? argv[0] : "solver");
         return 2;
     }
-    uint8_t *table = build_table(&diameter);
-    if (!table) {
-        fputs("could not build complete state table\n", stderr);
+    if (!build_query_tables()) {
+        fputs("could not build coordinate tables\n", stderr);
+        return 1;
+    }
+    uint8_t path[MAX_DEPTH];
+    uint32_t rank = rank_state(&state);
+    int length = solve_coordinate((uint16_t) (rank / ORIENTATIONS),
+                                  (uint16_t) (rank % ORIENTATIONS), path, NULL);
+    if (!replay_solution(state, path, length)) {
+        fputs("could not find a valid solution\n", stderr);
         return 1;
     }
     const char *separator = "";
-    for (uint32_t rank = rank_state(&state); rank; rank = rank_state(&state)) {
-        uint8_t move = table[rank];
-        printf("%s%s", separator, move_names[move]);
+    for (int i = 0; i < length; ++i) {
+        printf("%s%s", separator, move_names[path[i]]);
         separator = " ";
-        state = apply_move(state, move);
     }
     putchar('\n');
-    free(table);
     return output_failed();
 }
