@@ -214,6 +214,50 @@ static void build_transitions(uint16_t permutation[3][PERMUTATIONS],
     }
 }
 
+/* The caller supplies count distances and count queue entries. The VLA
+ * parameter describes the row stride of the existing table; it does not
+ * allocate storage. count is PERMUTATIONS or ORIENTATIONS.
+ */
+static int build_coordinate_distances(uint16_t count,
+                                      uint16_t turns[3][count],
+                                      uint8_t distance[count],
+                                      uint16_t queue[count])
+{
+    uint16_t head = 0, tail = 1;
+    memset(distance, UINT8_MAX, count);
+    distance[0] = 0;
+    queue[0] = 0;
+    while (head < tail) {
+        uint16_t here = queue[head++];
+        for (uint8_t face = 0; face < 3; ++face) {
+            uint16_t next = here;
+            for (uint8_t turn = 0; turn < 3; ++turn) {
+                next = turns[face][next];
+                /* One, two and three quarter turns are all neighbors of
+                 * here with HTM cost 1, not successive BFS depths.
+                 */
+                if (distance[next] == UINT8_MAX) {
+                    distance[next] = (uint8_t) (distance[here] + 1U);
+                    queue[tail++] = next;
+                }
+            }
+        }
+    }
+    return tail == count;
+}
+
+/* Each projection drops constraints, so both distances are lower bounds.
+ * Use max, not sum: the same move may improve both coordinates.
+ */
+static uint8_t coordinate_heuristic(uint16_t p,
+                                    uint16_t q,
+                                    const uint8_t permutation_distance[],
+                                    const uint8_t orientation_distance[])
+{
+    uint8_t dp = permutation_distance[p], dq = orientation_distance[q];
+    return dp > dq ? dp : dq;
+}
+
 static uint8_t *build_table(uint8_t *diameter)
 {
     uint8_t *toward_solved = malloc(STATES);
@@ -345,6 +389,60 @@ static int self_test(void)
     return 1;
 }
 
+/* Only the host self-test uses the exhaustive oracle. Walk its stored moves
+ * with the cubie model to obtain an exact distance independently of the new
+ * abstract BFS. This also checks that each oracle path actually solves.
+ */
+static int self_test_heuristic(const uint8_t *toward_solved)
+{
+    uint16_t permutation[3][PERMUTATIONS], orientation[3][ORIENTATIONS];
+    uint8_t permutation_distance[PERMUTATIONS];
+    uint8_t orientation_distance[ORIENTATIONS];
+    uint16_t queue[PERMUTATIONS];
+    uint32_t gaps[12] = {0};
+    uint8_t maximum = 0;
+    build_transitions(permutation, orientation);
+    if (!build_coordinate_distances(PERMUTATIONS, permutation,
+                                    permutation_distance, queue) ||
+        !build_coordinate_distances(ORIENTATIONS, orientation,
+                                    orientation_distance, queue))
+        return 0;
+    if (permutation_distance[0] != 0 || orientation_distance[0] != 0)
+        return 0;
+    for (uint32_t rank = 0; rank < STATES; ++rank) {
+        uint16_t p = (uint16_t) (rank / ORIENTATIONS);
+        uint16_t q = (uint16_t) (rank % ORIENTATIONS);
+        uint8_t h = coordinate_heuristic(p, q, permutation_distance,
+                                        orientation_distance);
+        uint8_t distance = 0;
+        uint32_t here = rank;
+        state_t state;
+        unrank_state(rank, &state);
+        while (here) {
+            uint8_t move = toward_solved[here];
+            if (move >= MOVES || distance == 11)
+                return 0;
+            state = apply_move(state, move);
+            here = rank_state(&state);
+            ++distance;
+        }
+        if (h > distance)
+            return 0;
+        ++gaps[distance - h];
+        if (h > maximum)
+            maximum = h;
+    }
+    /* Keep the existing stdout contract; these diagnostics are self-test
+     * statistics, not extra query output. All counts cover the full domain.
+     */
+    fprintf(stderr, "P/Q heuristic: 3674160 states checked; maximum %u\n",
+            (unsigned) maximum);
+    for (uint8_t gap = 0; gap < 12; ++gap)
+        fprintf(stderr, "distance - heuristic = %u: %lu states\n",
+                (unsigned) gap, (unsigned long) gaps[gap]);
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     state_t state;
@@ -359,11 +457,17 @@ int main(int argc, char **argv)
             fputs("could not build complete state table\n", stderr);
             return 1;
         }
-        free(table);
         if (diameter != 11) {
+            free(table);
             fputs("BFS check failed\n", stderr);
             return 1;
         }
+        if (!self_test_heuristic(table)) {
+            free(table);
+            fputs("heuristic check failed\n", stderr);
+            return 1;
+        }
+        free(table);
         puts("3674160 states; diameter 11");
         return output_failed();
     }
