@@ -188,18 +188,14 @@ static int valid(const state_t *state)
     return sum % 3U == 0;
 }
 
-static uint8_t *build_table(uint8_t *diameter)
+/* P and Q advance independently. Store only quarter turns; repeated lookups
+ * produce half and inverse turns, each of which still costs one HTM move.
+ * The caller owns the 34,614 bytes of transition storage.
+ */
+static void build_transitions(uint16_t permutation[3][PERMUTATIONS],
+                              uint16_t orientation[3][ORIENTATIONS])
 {
-    uint8_t *toward_solved = malloc(STATES);
-    uint32_t *queue = malloc((size_t) STATES * sizeof *queue);
-    uint16_t permutation[3][PERMUTATIONS], orientation[3][ORIENTATIONS];
-    uint32_t head = 0, tail = 1, level_end = 1;
     state_t state;
-    if (!toward_solved || !queue) {
-        free(toward_solved);
-        free(queue);
-        return NULL;
-    }
     for (uint16_t rank = 0; rank < PERMUTATIONS; ++rank) {
         unrank_state((uint32_t) rank * ORIENTATIONS, &state);
         for (uint8_t face = 0; face < 3; ++face) {
@@ -216,6 +212,20 @@ static uint8_t *build_table(uint8_t *diameter)
                 (uint16_t) (rank_state(&next) % ORIENTATIONS);
         }
     }
+}
+
+static uint8_t *build_table(uint8_t *diameter)
+{
+    uint8_t *toward_solved = malloc(STATES);
+    uint32_t *queue = malloc((size_t) STATES * sizeof *queue);
+    uint16_t permutation[3][PERMUTATIONS], orientation[3][ORIENTATIONS];
+    uint32_t head = 0, tail = 1, level_end = 1;
+    if (!toward_solved || !queue) {
+        free(toward_solved);
+        free(queue);
+        return NULL;
+    }
+    build_transitions(permutation, orientation);
     memset(toward_solved, UINT8_MAX, STATES);
     queue[0] = 0;
     toward_solved[0] = 0;
@@ -301,6 +311,7 @@ static int output_failed(void)
 static int self_test(void)
 {
     const state_t solved = {{0, 1, 2, 3, 4, 5, 6}, {0}};
+    uint16_t permutation[3][PERMUTATIONS], orientation[3][ORIENTATIONS];
     state_t state;
     for (uint8_t move = 0; move < MOVES; ++move) {
         state = solved;
@@ -309,10 +320,27 @@ static int self_test(void)
         if (memcmp(&solved, &state, sizeof solved))
             return 0;
     }
+    build_transitions(permutation, orientation);
     for (uint32_t rank = 0; rank < STATES; ++rank) {
         unrank_state(rank, &state);
         if (!valid(&state) || rank_state(&state) != rank)
             return 0;
+        /* Check factoring on every full state, not just the representative
+         * states used to construct the tables. Each turn is an HTM neighbor
+         * of the original state, even though lookups are chained here.
+         */
+        for (uint8_t face = 0; face < 3; ++face) {
+            uint16_t p = (uint16_t) (rank / ORIENTATIONS);
+            uint16_t q = (uint16_t) (rank % ORIENTATIONS);
+            state_t next = state;
+            for (uint8_t turn = 0; turn < 3; ++turn) {
+                next = quarter_turn(next, face);
+                p = permutation[face][p];
+                q = orientation[face][q];
+                if (rank_state(&next) != (uint32_t) p * ORIENTATIONS + q)
+                    return 0;
+            }
+        }
     }
     return 1;
 }
