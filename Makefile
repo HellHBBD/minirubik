@@ -33,7 +33,7 @@ SAMPLE_STATE := 21345671111111
 SAMPLE_SOLUTION := B' R' D2 R' B R B' R D2 B R'
 VECTORS := tests/solutions.txt
 # One per rejection path: short, long, cubie digit low, cubie digit high,
-# orientation digit low, orientation digit high, non-digit, duplicate, parity.
+# orientation digit low, orientation digit high, non-digit, duplicate, sum.
 INVALID_STATES := 1234567111111 123456711111111 02345671111111 82345671111111 \
 	12345671111110 12345671111114 1234567111111a 11345671111111 12345671111112
 
@@ -282,27 +282,7 @@ clean-rv32i:
 
 check: solver mini $(VECTORS)
 	./solver --self-test
-	@expected=$$(mktemp); actual=$$(mktemp); \
-		trap 'rm -f "$$expected" "$$actual"' 0 1 2 15; \
-		count=0; \
-		while IFS='|' read -r state solution; do \
-			case "$$state" in ""|\#*) continue ;; esac; \
-			printf '%s\n' "$$solution" >"$$expected"; \
-			for binary in ./solver ./mini; do \
-				$$binary "$$state" >"$$actual"; \
-				status=$$?; \
-				test $$status -eq 0 || { \
-					echo "$$binary $$state: exit status $$status"; exit 1; }; \
-				cmp -s "$$actual" "$$expected" || { \
-					echo "$$binary $$state: output mismatch"; \
-					echo "  expected: $$solution"; \
-					printf '  got:      '; cat "$$actual"; \
-					echo "  ($$(wc -c <"$$expected") bytes expected, \
-$$(wc -c <"$$actual") produced)"; exit 1; }; \
-			done; \
-			count=$$((count + 1)); \
-		done <$(VECTORS); \
-		echo "$$count solution vectors matched by solver and mini"
+	$(PYTHON) tests/check_solutions.py
 	@for binary in ./solver ./mini; do \
 		for bad in $(INVALID_STATES); do \
 			$$binary "$$bad" >/dev/null 2>&1; \
