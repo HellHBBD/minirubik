@@ -8,7 +8,7 @@ RV_ASFLAGS ?= --target=riscv32-unknown-elf -march=rv32i -mabi=ilp32
 RV_BUILD ?= build-rv32i
 RV_INPUT ?= riscv/input.S
 RIPES ?= /usr/bin/ripes
-RV_PROC ?= RV32_SS
+RV_PROC ?= RV32_ISS
 PYTHON ?= python3
 CLANG_FORMAT := $(shell command -v clang-format-20 2>/dev/null || \
 	command -v clang-format 2>/dev/null)
@@ -60,14 +60,20 @@ $(RV_BUILD)/move.o: riscv/move.S | $(RV_BUILD)
 $(RV_BUILD)/search.o: riscv/search.S | $(RV_BUILD)
 	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
 
+$(RV_BUILD)/replay.o: riscv/replay.S | $(RV_BUILD)
+	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+
+$(RV_BUILD)/output.o: riscv/output.S | $(RV_BUILD)
+	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+
 force-rv-input:
 
 $(RV_BUILD)/input.o: $(RV_INPUT) force-rv-input | $(RV_BUILD)
 	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
 
-$(RV_BUILD)/smoke.debug.elf: $(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/heuristic.o $(RV_BUILD)/move.o $(RV_BUILD)/search.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o riscv/link.ld
+$(RV_BUILD)/smoke.debug.elf: $(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/heuristic.o $(RV_BUILD)/move.o $(RV_BUILD)/search.o $(RV_BUILD)/replay.o $(RV_BUILD)/output.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o riscv/link.ld
 	$(RV_LD) -m elf32lriscv --no-relax -T riscv/link.ld -o "$@" \
-		$(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/heuristic.o $(RV_BUILD)/move.o $(RV_BUILD)/search.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o
+		$(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/heuristic.o $(RV_BUILD)/move.o $(RV_BUILD)/search.o $(RV_BUILD)/replay.o $(RV_BUILD)/output.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o
 
 $(RV_BUILD)/smoke.elf: $(RV_BUILD)/smoke.debug.elf
 	$(RV_OBJCOPY) --strip-all --remove-section=.riscv.attributes "$<" "$@"
@@ -118,7 +124,25 @@ $(RV_BUILD)/heuristic-check.elf: $(RV_BUILD)/heuristic-check.debug.elf
 rv32i-heuristic-check: $(RV_BUILD)/heuristic-check.elf
 	$(PYTHON) riscv/check_heuristics.py "$(RIPES)" "$<" "$(RV_PROC)"
 
+.PHONY: rv32i-replay-check
+$(RV_BUILD)/replay-check.o: riscv/replay_check.S | $(RV_BUILD)
+	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+
+$(RV_BUILD)/replay-check.debug.elf: $(RV_BUILD)/replay-check.o $(RV_BUILD)/replay.o $(RV_BUILD)/move.o $(RV_BUILD)/tables.o riscv/link.ld
+	$(RV_LD) -m elf32lriscv --no-relax -T riscv/link.ld -o "$@" \
+		$(RV_BUILD)/replay-check.o $(RV_BUILD)/replay.o $(RV_BUILD)/move.o $(RV_BUILD)/tables.o
+
+$(RV_BUILD)/replay-check.elf: $(RV_BUILD)/replay-check.debug.elf
+	$(RV_OBJCOPY) --strip-all --remove-section=.riscv.attributes "$<" "$@"
+
+rv32i-replay-check: $(RV_BUILD)/replay-check.elf
+	$(PYTHON) riscv/check_replay.py "$(RIPES)" "$<" "$(RV_PROC)"
+
 clean-rv32i:
+	$(RM) "$(RV_BUILD)/replay-check.o" "$(RV_BUILD)/replay-check.debug.elf" \
+		"$(RV_BUILD)/replay-check.elf" $(wildcard $(RV_BUILD)/replay-check.*.report.json)
+	$(RM) "$(RV_BUILD)/move.o" "$(RV_BUILD)/search.o" \
+		"$(RV_BUILD)/replay.o" "$(RV_BUILD)/output.o"
 	$(RM) "$(RV_BUILD)/heuristic.o" "$(RV_BUILD)/heuristic-cases.S" \
 		"$(RV_BUILD)/heuristic-cases.o" "$(RV_BUILD)/heuristic-check.o" \
 		"$(RV_BUILD)/heuristic-check.debug.elf" "$(RV_BUILD)/heuristic-check.elf" \

@@ -1,4 +1,4 @@
-"""Compare the RV32I input checkpoint with the native C parser."""
+"""Check target parsing, optimal length, replay and exact solution output."""
 
 import json
 import os
@@ -70,7 +70,9 @@ def replay(state, path):
     return p == list(range(7)) and o == [0] * 7
 
 
-def check(ripes, elf, processor):
+def check(ripes, elf, processor, sim_timeout=30000):
+    if sim_timeout <= 0:
+        raise ValueError('Ripes timeout must be positive')
     input_bytes, stack_top = external_input(elf)
     native = subprocess.run([b'./solver', b'--parse-state', input_bytes],
                             capture_output=True, timeout=15)
@@ -108,11 +110,11 @@ def check(ripes, elf, processor):
         expected['h'] = 0
         expected['length'] = -1
     command = [ripes, '--mode', 'cli', '--src', elf, '-t', 'elf',
-               '--proc', processor, '--timeout', '30000', '--json',
+               '--proc', processor, '--timeout', str(sim_timeout), '--json',
                '--iret', '--regs', '--runinfo']
     result = subprocess.run(command, capture_output=True, text=True,
                             env={**os.environ, 'QT_QPA_PLATFORM': 'offscreen'},
-                            timeout=45)
+                            timeout=sim_timeout / 1000 + 15)
     if result.returncode != 0 or 'ERROR:' in result.stdout + result.stderr:
         raise ValueError('Ripes failed: ' + result.stdout + result.stderr)
     start = result.stdout.find('{')
@@ -137,6 +139,14 @@ def check(ripes, elf, processor):
     if length != expected['length']:
         raise ValueError('RV32I solution length differs from the exact native solver')
     path = []
+    # This pinned Ripes build includes the print-string terminator in CLI
+    # stdout and appends its own exit notice before the telemetry JSON.
+    footer = f'\nProgram exited with code: {native.returncode}\n'
+    transport = result.stdout[:start]
+    if not transport.endswith(footer):
+        raise ValueError('Ripes did not report the expected guest exit status')
+    raw_output = transport[:-len(footer)]
+    output = raw_output.replace('\0', '')
     if native.returncode == 0:
         if not 0 <= length <= 11:
             raise ValueError('Invalid solution length')
@@ -144,16 +154,23 @@ def check(ripes, elf, processor):
         path += [(registers['x24'] >> (4 * i)) & 15 for i in range(max(length - 8, 0))]
         if not replay(native.stdout, path):
             raise ValueError('RV32I solution did not replay to solved')
-    marker = 'RV32I input valid\n' if native.returncode == 0 else 'RV32I input invalid\n'
-    if marker not in result.stdout:
-        raise ValueError('RV32I guest did not print the expected input marker')
+        if registers['x25'] != 0 or registers['x26'] != 0 or registers['x27'] != length:
+            raise ValueError('RV32I target replay did not apply the full path to solved')
+        expected_output = ' '.join(MOVE_NAMES[m] for m in path) + '\n'
+    else:
+        if any(registers[r] for r in ('x23', 'x24', 'x25', 'x26', 'x27')):
+            raise ValueError('Invalid input reached search or replay')
+        expected_output = 'Invalid cube state\n'
+    if output != expected_output:
+        raise ValueError(f'RV32I guest output mismatch: {output!r}, expected {expected_output!r}')
     if report['# instructions retired'] <= 0:
         raise ValueError('Ripes did not retire instructions')
     if report['runinfo']['processor'] != processor:
         raise ValueError('Ripes processor differs from the requested model')
     if report['runinfo']['ISA extensions'] != []:
         raise ValueError('Smoke test requires base RV32I without extensions')
-    evidence = {'command': command, 'expected': expected, 'path': path, 'report': report}
+    evidence = {'command': command, 'expected': expected, 'path': path,
+                'guest_output': output, 'raw_guest_output': raw_output, 'report': report}
     Path(elf).with_suffix('.report.json').write_text(
         json.dumps(evidence, indent=2) + '\n')
     print(f'RV32I smoke passed: {processor}, '

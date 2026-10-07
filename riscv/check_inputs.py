@@ -1,4 +1,4 @@
-"""Exercise the handwritten input parser against the native C parse oracle."""
+"""Check parser, solver, target replay and output against the native oracle."""
 
 import argparse
 import json
@@ -94,7 +94,7 @@ def run(args):
     directory = build / 'input-cases'
     directory.mkdir(exist_ok=True)
     records = []
-    output = build / f'input-check-{first}-{first + count}.json'
+    output = build / f'input-check-{args.processor}-{first}-{first + count}.json'
     try:
         for index in range(first, first + count):
             labels, data = suite[index]
@@ -106,7 +106,8 @@ def run(args):
                               '.size cube_input, .-cube_input\n')
             before = time.perf_counter()
             build_input(build, source)
-            evidence = check(args.ripes, str(build / 'smoke.elf'), args.processor)
+            evidence = check(args.ripes, str(build / 'smoke.elf'), args.processor,
+                             args.sim_timeout)
             records.append({'index': index, 'labels': labels,
                             'object_input_hex': data.hex(),
                             'elapsed_seconds': time.perf_counter() - before,
@@ -118,7 +119,7 @@ def run(args):
     finally:
         # Each case uses a generated object; never edit the user's input.S.
         build_input(build, Path(args.input))
-        check(args.ripes, str(build / 'smoke.elf'), args.processor)
+        check(args.ripes, str(build / 'smoke.elf'), args.processor, args.sim_timeout)
     valid = sum(r['expected']['status'] == 0 for r in records)
     print(f'INPUT RANGE [{first},{first + count}) PASSED: '
           f'{valid} valid, {count - valid} invalid; '
@@ -129,7 +130,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--ripes', default='/usr/bin/ripes')
     parser.add_argument('--build', default='build-rv32i')
-    parser.add_argument('--processor', default='RV32_SS')
+    parser.add_argument('--processor', default='RV32_ISS')
+    parser.add_argument('--sim-timeout', type=int, default=30000,
+                        help='finite Ripes per-case timeout in milliseconds')
     parser.add_argument('--input', default='riscv/input.S')
     parser.add_argument('--first', type=int, default=0)
     parser.add_argument('--count', type=int)

@@ -1,10 +1,12 @@
-/* A5: search checkpoint; s6=length, s7/s8=path nibbles for host replay.
- * Ripes services: a7=4 prints the string at a0; a7=10 terminates.
+/* A6: solve, replay on target, then print the actual shortest path.
+ * Ripes services: a7=4 prints the string at a0; a7=93 exits with a0 status.
  * s0 records status (0=valid, 1=checkpoint failure, 2=invalid input).
  * s1/s2 expose parsed bytes as fixed-width base-8/base-4 fingerprints;
  * these diagnostics are not the Lehmer P or base-3 Q coordinates.
  * s3/s4 expose the actual P/Q coordinates after a successful parse.
  * s5 exposes the admissible heuristic.
+ * s6=length, s7/s8=path nibbles for independent host replay.
+ * s9/s10=target replay final P/Q, s11=number of applied moves.
  */
 .option norvc
 .option norelax
@@ -21,6 +23,9 @@ _start:
     li s6, -1
     li s7, 0
     li s8, 0
+    li s9, 0
+    li s10, 0
+    li s11, 0
     la t0, cube_permutation_turn
     la t1, cube_orientation_turn
 
@@ -128,8 +133,20 @@ _start:
     addi t1, t1, 1
     j .Lpath
 .Lpath_done:
-    la a0, .Lpass_message
-    j .Lreport
+    mv a0, s3
+    mv a1, s4
+    la a2, cube_path
+    mv a3, s6
+    jal ra, cube_replay
+    mv s9, a1
+    mv s10, a2
+    mv s11, a3
+    bnez a0, .Lfail
+    bne s11, s6, .Lfail
+    la a0, cube_path
+    mv a1, s6
+    jal ra, cube_print_path
+    j .Lexit
 .Linvalid_input:
     la a0, .Linvalid_message
     j .Lreport
@@ -139,18 +156,19 @@ _start:
 .Lreport:
     li a7, 4
     ecall
+.Lexit:
     mv a0, s0
-    li a7, 10
+    li a7, 93
     ecall
+.Lhalt:
+    j .Lhalt
 .size _start, .-_start
 
 .section .rodata.smoke, "a", @progbits
-.Lpass_message:
-    .asciz "RV32I input valid\n"
 .Linvalid_message:
-    .asciz "RV32I input invalid\n"
+    .asciz "Invalid cube state\n"
 .Lfail_message:
-    .asciz "RV32I checkpoint failed\n"
+    .asciz "RV32I solver verification failed\n"
 
 .section .bss.cube_state, "aw", @nobits
 .balign 4
