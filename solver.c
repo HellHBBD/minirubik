@@ -517,6 +517,40 @@ static uint8_t query_heuristic(uint16_t p, uint16_t q)
     return basic > mixed ? basic : mixed;
 }
 
+static int emit_heuristic_cases(void)
+{
+    uint16_t representatives[SUBSETS];
+    uint8_t expected[PERMUTATIONS + MIXED_STATES];
+    if (!build_query_tables())
+        return 0;
+    for (uint8_t s = 0; s < SUBSETS; ++s)
+        representatives[s] = UINT16_MAX;
+    for (uint16_t p = 0; p < PERMUTATIONS; ++p) {
+        uint8_t s = query_tables.permutation_subset[p];
+        if (s >= SUBSETS)
+            return 0;
+        if (representatives[s] == UINT16_MAX)
+            representatives[s] = p;
+        expected[p] = query_heuristic(p, 0);
+    }
+    for (uint8_t s = 0; s < SUBSETS; ++s) {
+        if (representatives[s] == UINT16_MAX)
+            return 0;
+        for (uint16_t q = 0; q < ORIENTATIONS; ++q)
+            expected[PERMUTATIONS + s * ORIENTATIONS + q] =
+                query_heuristic(representatives[s], q);
+    }
+    fputs(".section .rodata.heuristic_cases, \"a\", @progbits\n.balign 2\n"
+          ".globl cube_heuristic_representatives\n"
+          ".type cube_heuristic_representatives, @object\n"
+          "cube_heuristic_representatives:\n    .2byte ", stdout);
+    for (uint8_t s = 0; s < SUBSETS; ++s)
+        printf("%u%s", (unsigned) representatives[s], s == SUBSETS - 1 ? "\n" : ",");
+    fputs(".size cube_heuristic_representatives, .-cube_heuristic_representatives\n", stdout);
+    emit_byte_table("cube_heuristic_expected", expected, sizeof expected);
+    return 1;
+}
+
 typedef struct {
     uint16_t p, q;
     uint8_t previous_face, next_move;
@@ -1050,10 +1084,17 @@ int main(int argc, char **argv)
     uint8_t diameter;
     /* Host parse/rank oracles for the assembly input checkpoint. */
     if (argc == 3 && (!strcmp(argv[1], "--parse-state") ||
-                     !strcmp(argv[1], "--rank-state"))) {
+                     !strcmp(argv[1], "--rank-state") ||
+                     !strcmp(argv[1], "--heuristic-state"))) {
         if (!parse_state(argv[2], &state))
             return 2;
-        if (!strcmp(argv[1], "--rank-state")) {
+        if (!strcmp(argv[1], "--heuristic-state")) {
+            uint32_t rank = rank_state(&state);
+            if (!build_query_tables())
+                return 1;
+            printf("%u\n", (unsigned) query_heuristic((uint16_t) (rank / ORIENTATIONS),
+                                                     (uint16_t) (rank % ORIENTATIONS)));
+        } else if (!strcmp(argv[1], "--rank-state")) {
             uint32_t rank = rank_state(&state);
             printf("%lu %lu\n", (unsigned long) (rank / ORIENTATIONS),
                     (unsigned long) (rank % ORIENTATIONS));
@@ -1061,6 +1102,11 @@ int main(int argc, char **argv)
             fwrite(state.p, 1, CUBIES, stdout);
             fwrite(state.o, 1, CUBIES, stdout);
         }
+        return output_failed();
+    }
+    if (argc == 2 && !strcmp(argv[1], "--emit-heuristic-cases")) {
+        if (!emit_heuristic_cases())
+            return 1;
         return output_failed();
     }
     if (argc == 2 && !strcmp(argv[1], "--emit-rank-cases")) {

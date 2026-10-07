@@ -74,12 +74,18 @@ def check(ripes, elf, processor):
         if not (0 <= p < 5040 and 0 <= q < 729):
             raise ValueError('Native rank oracle returned invalid coordinates')
         expected['p'], expected['q'] = p, q
+        h = subprocess.run([b'./solver', b'--heuristic-state', input_bytes],
+                           capture_output=True, timeout=15)
+        if h.returncode != 0:
+            raise ValueError('Native heuristic oracle failed')
+        expected['h'] = int(h.stdout)
     else:
         if native.stdout:
             raise ValueError('Native parse oracle emitted an invalid state')
         expected['permutation_fingerprint'] = 0
         expected['orientation_fingerprint'] = 0
         expected['p'], expected['q'] = 0, 0
+        expected['h'] = 0
     command = [ripes, '--mode', 'cli', '--src', elf, '-t', 'elf',
                '--proc', processor, '--timeout', '5000', '--json',
                '--iret', '--regs', '--runinfo']
@@ -102,6 +108,8 @@ def check(ripes, elf, processor):
         raise ValueError('RV32I parser did not preserve the stack pointer')
     if registers['x19'] != expected['p'] or registers['x20'] != expected['q']:
         raise ValueError('RV32I P/Q ranks differ from the native C rank oracle')
+    if registers['x21'] != expected['h']:
+        raise ValueError('RV32I heuristic differs from the native C oracle')
     marker = 'RV32I input valid\n' if native.returncode == 0 else 'RV32I input invalid\n'
     if marker not in result.stdout:
         raise ValueError('RV32I guest did not print the expected input marker')

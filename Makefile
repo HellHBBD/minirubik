@@ -51,14 +51,17 @@ $(RV_BUILD)/parse.o: riscv/parse.S | $(RV_BUILD)
 $(RV_BUILD)/rank.o: riscv/rank.S | $(RV_BUILD)
 	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
 
+$(RV_BUILD)/heuristic.o: riscv/heuristic.S | $(RV_BUILD)
+	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+
 force-rv-input:
 
 $(RV_BUILD)/input.o: $(RV_INPUT) force-rv-input | $(RV_BUILD)
 	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
 
-$(RV_BUILD)/smoke.debug.elf: $(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o riscv/link.ld
+$(RV_BUILD)/smoke.debug.elf: $(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/heuristic.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o riscv/link.ld
 	$(RV_LD) -m elf32lriscv --no-relax -T riscv/link.ld -o "$@" \
-		$(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o
+		$(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/heuristic.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o
 
 $(RV_BUILD)/smoke.elf: $(RV_BUILD)/smoke.debug.elf
 	$(RV_OBJCOPY) --strip-all --remove-section=.riscv.attributes "$<" "$@"
@@ -89,7 +92,31 @@ $(RV_BUILD)/rank-check.elf: $(RV_BUILD)/rank-check.debug.elf
 rv32i-rank-check: $(RV_BUILD)/rank-check.elf
 	$(PYTHON) riscv/check_ranks.py "$(RIPES)" "$<" "$(RV_PROC)"
 
+.PHONY: rv32i-heuristic-check
+$(RV_BUILD)/heuristic-cases.S: solver | $(RV_BUILD)
+	./solver --emit-heuristic-cases >"$@"
+
+$(RV_BUILD)/heuristic-cases.o: $(RV_BUILD)/heuristic-cases.S
+	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+
+$(RV_BUILD)/heuristic-check.o: riscv/heuristic_check.S | $(RV_BUILD)
+	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+
+$(RV_BUILD)/heuristic-check.debug.elf: $(RV_BUILD)/heuristic-check.o $(RV_BUILD)/heuristic.o $(RV_BUILD)/tables.o $(RV_BUILD)/heuristic-cases.o riscv/link.ld
+	$(RV_LD) -m elf32lriscv --no-relax -T riscv/link.ld -o "$@" \
+		$(RV_BUILD)/heuristic-check.o $(RV_BUILD)/heuristic.o $(RV_BUILD)/tables.o $(RV_BUILD)/heuristic-cases.o
+
+$(RV_BUILD)/heuristic-check.elf: $(RV_BUILD)/heuristic-check.debug.elf
+	$(RV_OBJCOPY) --strip-all --remove-section=.riscv.attributes "$<" "$@"
+
+rv32i-heuristic-check: $(RV_BUILD)/heuristic-check.elf
+	$(PYTHON) riscv/check_heuristics.py "$(RIPES)" "$<" "$(RV_PROC)"
+
 clean-rv32i:
+	$(RM) "$(RV_BUILD)/heuristic.o" "$(RV_BUILD)/heuristic-cases.S" \
+		"$(RV_BUILD)/heuristic-cases.o" "$(RV_BUILD)/heuristic-check.o" \
+		"$(RV_BUILD)/heuristic-check.debug.elf" "$(RV_BUILD)/heuristic-check.elf" \
+		"$(RV_BUILD)/heuristic-check.report.json"
 	$(RM) "$(RV_BUILD)/tables.S" "$(RV_BUILD)/tables.o" \
 		"$(RV_BUILD)/entry.o" "$(RV_BUILD)/parse.o" "$(RV_BUILD)/rank.o" "$(RV_BUILD)/input.o" \
 		"$(RV_BUILD)/smoke.debug.elf" "$(RV_BUILD)/smoke.elf" \
