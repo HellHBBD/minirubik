@@ -9,7 +9,11 @@
 .globl cube_replay
 .type cube_replay, @function
 cube_replay:
+#if RENDER
+    addi sp, sp, -32
+#else
     addi sp, sp, -16
+#endif
     sw s0, 0(sp)
     sw s1, 4(sp)
     sw s2, 8(sp)
@@ -29,12 +33,34 @@ cube_replay:
     li t0, 9
     bgeu a2, t0, .Lfail
     jal ra, cube_apply_move
+#if RENDER
+    sw a0, 16(sp)
+    sw a1, 20(sp)
+    lbu a0, 0(s0)
+    jal ra, cube_render_step
+    lw a0, 16(sp)
+    lw a1, 20(sp)
+#endif
     addi s0, s0, 1
     addi s2, s2, 1
     j .Lnext
 .Ldone:
     or t0, a0, a1
     snez t1, t0
+#if RENDER
+    /* Independently require the displayed logical cubies to be solved. */
+    la t0, cube_state
+    li t3, 0
+.Lrender_solved:
+    lbu t4, 0(t0)
+    bne t4, t3, .Lfail
+    lbu t4, 7(t0)
+    bnez t4, .Lfail
+    addi t0, t0, 1
+    addi t3, t3, 1
+    li t4, 7
+    bltu t3, t4, .Lrender_solved
+#endif
     j .Lreturn
 .Lfail:
     li t1, 1
@@ -47,6 +73,10 @@ cube_replay:
     lw s1, 4(sp)
     lw s2, 8(sp)
     lw ra, 12(sp)
+#if RENDER
+    addi sp, sp, 32
+#else
     addi sp, sp, 16
+#endif
     ret
 .size cube_replay, .-cube_replay

@@ -72,6 +72,12 @@ _start:
     jal ra, cube_parse_state
     mv s0, a0
     bnez a0, .Linvalid_input
+#if RENDER_TEST
+    jal ra, cube_render_test_init
+#endif
+#if RENDER
+    jal ra, cube_render
+#endif
 
     /* Expose all fourteen parsed bytes for the host checker. */
     la t0, cube_state

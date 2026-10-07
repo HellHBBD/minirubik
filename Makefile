@@ -16,6 +16,16 @@ RV_GCC ?= riscv64-elf-gcc
 RV_REFERENCE_FLAGS ?= -O2 -std=c99 -march=rv32i -mabi=ilp32 -ffreestanding \
 	-fno-builtin -fno-pic -fno-pie -msmall-data-limit=0 -mno-relax \
 	-ffunction-sections -fdata-sections
+RV_RENDER ?= 0
+RV_RENDER_TEST ?= 0
+RV_RENDER_DELAY ?= 50000
+RV_LED_SYMBOLS ?= $(abspath riscv/led_symbols.inc)
+RV_GUI_INPUT ?= $(RV_INPUT)
+RV_RENDER_FIXTURE ?= $(RV_BUILD)/render-fixtures.S
+RV_RENDER_FLAGS = -DRENDER=$(RV_RENDER) -DRENDER_TEST=$(RV_RENDER_TEST) \
+	-DRENDER_DELAY=$(RV_RENDER_DELAY) -DLED_SYMBOLS='"$(RV_LED_SYMBOLS)"' \
+	-DRENDER_TABLES='"$(abspath $(RV_BUILD)/render-tables.inc)"'
+RV_RENDER_TEST_OBJECTS = $(if $(filter 1,$(RV_RENDER_TEST)),$(RV_BUILD)/render-check.o $(RV_BUILD)/render-fixtures.o)
 CLANG_FORMAT := $(shell command -v clang-format-20 2>/dev/null || \
 	command -v clang-format 2>/dev/null)
 C_SOURCES := $(wildcard *.c *.h)
@@ -48,8 +58,17 @@ $(RV_BUILD)/tables.S: solver | $(RV_BUILD)
 $(RV_BUILD)/tables.o: $(RV_BUILD)/tables.S
 	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
 
-$(RV_BUILD)/entry.o: riscv/entry.S | $(RV_BUILD)
-	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+.PHONY: force-render-config
+force-render-config:
+
+$(RV_BUILD)/render-config: force-render-config | $(RV_BUILD)
+	@$(PYTHON) -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); v="\n".join(sys.argv[2:])+"\n"; p.write_text(v) if not p.exists() or p.read_text()!=v else None' "$@" "$(RV_RENDER)" "$(RV_RENDER_TEST)" "$(RV_RENDER_DELAY)" "$(RV_LED_SYMBOLS)"
+
+$(RV_BUILD)/render-tables.inc: riscv/cube_geometry.py riscv/check_smoke.py | $(RV_BUILD)
+	$(PYTHON) riscv/cube_geometry.py >"$@"
+
+$(RV_BUILD)/entry.o: riscv/entry.S $(RV_BUILD)/render-config | $(RV_BUILD)
+	$(RV_CC) $(RV_ASFLAGS) $(RV_RENDER_FLAGS) -c "$<" -o "$@"
 
 $(RV_BUILD)/parse.o: riscv/parse.S | $(RV_BUILD)
 	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
@@ -66,7 +85,16 @@ $(RV_BUILD)/move.o: riscv/move.S | $(RV_BUILD)
 $(RV_BUILD)/search.o: riscv/search.S | $(RV_BUILD)
 	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
 
-$(RV_BUILD)/replay.o: riscv/replay.S | $(RV_BUILD)
+$(RV_BUILD)/replay.o: riscv/replay.S $(RV_BUILD)/render-config | $(RV_BUILD)
+	$(RV_CC) $(RV_ASFLAGS) $(RV_RENDER_FLAGS) -c "$<" -o "$@"
+
+$(RV_BUILD)/render.o: riscv/render.S $(RV_BUILD)/render-config $(RV_BUILD)/render-tables.inc $(if $(filter 1,$(RV_RENDER)),$(RV_LED_SYMBOLS)) | $(RV_BUILD)
+	$(RV_CC) $(RV_ASFLAGS) $(RV_RENDER_FLAGS) -c "$<" -o "$@"
+
+$(RV_BUILD)/render-check.o: riscv/render_check.S | $(RV_BUILD)
+	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+
+$(RV_BUILD)/render-fixtures.o: $(RV_RENDER_FIXTURE) | $(RV_BUILD)
 	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
 
 $(RV_BUILD)/output.o: riscv/output.S | $(RV_BUILD)
@@ -77,9 +105,9 @@ force-rv-input:
 $(RV_BUILD)/input.o: $(RV_INPUT) force-rv-input | $(RV_BUILD)
 	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
 
-$(RV_BUILD)/smoke.debug.elf: $(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/heuristic.o $(RV_BUILD)/move.o $(RV_BUILD)/search.o $(RV_BUILD)/replay.o $(RV_BUILD)/output.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o riscv/link.ld
+$(RV_BUILD)/smoke.debug.elf: $(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/heuristic.o $(RV_BUILD)/move.o $(RV_BUILD)/search.o $(RV_BUILD)/replay.o $(RV_BUILD)/render.o $(RV_RENDER_TEST_OBJECTS) $(RV_BUILD)/output.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o riscv/link.ld
 	$(RV_LD) -m elf32lriscv --no-relax -T riscv/link.ld -o "$@" \
-		$(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/heuristic.o $(RV_BUILD)/move.o $(RV_BUILD)/search.o $(RV_BUILD)/replay.o $(RV_BUILD)/output.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o
+		$(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/heuristic.o $(RV_BUILD)/move.o $(RV_BUILD)/search.o $(RV_BUILD)/replay.o $(RV_BUILD)/render.o $(RV_RENDER_TEST_OBJECTS) $(RV_BUILD)/output.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o
 
 $(RV_BUILD)/smoke.elf: $(RV_BUILD)/smoke.debug.elf
 	$(RV_OBJCOPY) --strip-all --remove-section=.riscv.attributes "$<" "$@"
@@ -105,9 +133,9 @@ $(RV_BUILD)/reference.o: riscv/reference.c solver.c | $(RV_BUILD)
 $(RV_BUILD)/reference-bridge.o: riscv/reference_bridge.S | $(RV_BUILD)
 	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
 
-$(RV_BUILD)/reference.debug.elf: $(RV_BUILD)/entry.o $(RV_BUILD)/replay.o $(RV_BUILD)/output.o $(RV_BUILD)/reference.o $(RV_BUILD)/reference-bridge.o $(RV_BUILD)/reference-tables.o $(RV_BUILD)/input.o riscv/link.ld
+$(RV_BUILD)/reference.debug.elf: $(RV_BUILD)/entry.o $(RV_BUILD)/replay.o $(RV_BUILD)/render.o $(RV_RENDER_TEST_OBJECTS) $(RV_BUILD)/output.o $(RV_BUILD)/reference.o $(RV_BUILD)/reference-bridge.o $(RV_BUILD)/reference-tables.o $(RV_BUILD)/input.o riscv/link.ld
 	$(RV_LD) -m elf32lriscv --no-relax --gc-sections -T riscv/link.ld -o "$@" \
-		$(RV_BUILD)/entry.o $(RV_BUILD)/replay.o $(RV_BUILD)/output.o \
+		$(RV_BUILD)/entry.o $(RV_BUILD)/replay.o $(RV_BUILD)/render.o $(RV_RENDER_TEST_OBJECTS) $(RV_BUILD)/output.o \
 		$(RV_BUILD)/reference.o $(RV_BUILD)/reference-bridge.o \
 		$(RV_BUILD)/reference-tables.o $(RV_BUILD)/input.o
 
@@ -217,7 +245,16 @@ $(RV_BUILD)/calibration.elf: $(RV_BUILD)/calibration.debug.elf
 
 rv32i-calibration: $(RV_BUILD)/calibration.elf
 
+.PHONY: rv32i-gui rv32i-render-check
+rv32i-gui:
+	$(MAKE) rv32i RV_BUILD=$(RV_BUILD)/gui RV_INPUT=$(RV_GUI_INPUT) RV_RENDER=1 RV_RENDER_TEST=0
+
+rv32i-render-check:
+	$(PYTHON) riscv/check_render.py
+
 clean-rv32i:
+	$(RM) "$(RV_BUILD)/render.o" "$(RV_BUILD)/render-check.o" \
+		"$(RV_BUILD)/render-fixtures.o" "$(RV_BUILD)/render-config" "$(RV_BUILD)/render-tables.inc"
 	$(RM) "$(RV_BUILD)/reference-rank.debug.elf" "$(RV_BUILD)/reference-rank.elf" \
 		"$(RV_BUILD)/reference-rank.report.json" "$(RV_BUILD)/reference-heuristic.debug.elf" \
 		"$(RV_BUILD)/reference-heuristic.elf" "$(RV_BUILD)/reference-heuristic.report.json"
