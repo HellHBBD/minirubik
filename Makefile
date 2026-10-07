@@ -12,6 +12,10 @@ RV_PROC ?= RV32_ISS
 PYTHON ?= python3
 RV_CAL_BYTES ?= 65536
 RV_CAL_PASSES ?= 1
+RV_GCC ?= riscv64-elf-gcc
+RV_REFERENCE_FLAGS ?= -O2 -std=c99 -march=rv32i -mabi=ilp32 -ffreestanding \
+	-fno-builtin -fno-pic -fno-pie -msmall-data-limit=0 -mno-relax \
+	-ffunction-sections -fdata-sections
 CLANG_FORMAT := $(shell command -v clang-format-20 2>/dev/null || \
 	command -v clang-format 2>/dev/null)
 C_SOURCES := $(wildcard *.c *.h)
@@ -82,6 +86,64 @@ $(RV_BUILD)/smoke.elf: $(RV_BUILD)/smoke.debug.elf
 
 rv32i-smoke: $(RV_BUILD)/smoke.elf
 	$(PYTHON) riscv/check_smoke.py "$(RIPES)" "$<" "$(RV_PROC)"
+
+.PHONY: rv32i-reference rv32i-reference-check rv32i-reference-input-check rv32i-reference-rank-check rv32i-reference-heuristic-check rv32i-reference-info rv32i-compare
+rv32i-reference-info:
+	@$(PYTHON) -c 'import json,sys; print(json.dumps({"compiler":sys.argv[1],"flags":sys.argv[2]}))' "$(RV_GCC)" "$(RV_REFERENCE_FLAGS)"
+
+rv32i-compare:
+	$(PYTHON) riscv/compare_reference.py
+$(RV_BUILD)/reference-tables.S: solver | $(RV_BUILD)
+	./solver --emit-reference-tables >"$@"
+
+$(RV_BUILD)/reference-tables.o: $(RV_BUILD)/reference-tables.S
+	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+
+$(RV_BUILD)/reference.o: riscv/reference.c solver.c | $(RV_BUILD)
+	$(RV_GCC) $(RV_REFERENCE_FLAGS) -c "$<" -o "$@"
+
+$(RV_BUILD)/reference-bridge.o: riscv/reference_bridge.S | $(RV_BUILD)
+	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+
+$(RV_BUILD)/reference.debug.elf: $(RV_BUILD)/entry.o $(RV_BUILD)/replay.o $(RV_BUILD)/output.o $(RV_BUILD)/reference.o $(RV_BUILD)/reference-bridge.o $(RV_BUILD)/reference-tables.o $(RV_BUILD)/input.o riscv/link.ld
+	$(RV_LD) -m elf32lriscv --no-relax --gc-sections -T riscv/link.ld -o "$@" \
+		$(RV_BUILD)/entry.o $(RV_BUILD)/replay.o $(RV_BUILD)/output.o \
+		$(RV_BUILD)/reference.o $(RV_BUILD)/reference-bridge.o \
+		$(RV_BUILD)/reference-tables.o $(RV_BUILD)/input.o
+
+$(RV_BUILD)/reference.elf: $(RV_BUILD)/reference.debug.elf
+	$(RV_OBJCOPY) --strip-all --remove-section=.riscv.attributes "$<" "$@"
+
+rv32i-reference: $(RV_BUILD)/reference.elf
+
+rv32i-reference-check: $(RV_BUILD)/reference.elf
+	$(PYTHON) riscv/check_smoke.py "$(RIPES)" "$<" "$(RV_PROC)"
+
+rv32i-reference-input-check: $(RV_BUILD)/reference.elf
+	$(PYTHON) riscv/check_inputs.py --ripes "$(RIPES)" --build "$(RV_BUILD)" \
+		--processor "$(RV_PROC)" --input "$(RV_INPUT)" --target rv32i-reference
+
+$(RV_BUILD)/reference-rank.debug.elf: $(RV_BUILD)/rank-check.o $(RV_BUILD)/reference.o $(RV_BUILD)/reference-bridge.o $(RV_BUILD)/rank-cases.o riscv/link.ld
+	$(RV_LD) -m elf32lriscv --no-relax --gc-sections -T riscv/link.ld -o "$@" \
+		$(RV_BUILD)/rank-check.o $(RV_BUILD)/reference.o \
+		$(RV_BUILD)/reference-bridge.o $(RV_BUILD)/rank-cases.o
+
+$(RV_BUILD)/reference-rank.elf: $(RV_BUILD)/reference-rank.debug.elf
+	$(RV_OBJCOPY) --strip-all --remove-section=.riscv.attributes "$<" "$@"
+
+rv32i-reference-rank-check: $(RV_BUILD)/reference-rank.elf
+	$(PYTHON) riscv/check_ranks.py "$(RIPES)" "$<" "$(RV_PROC)"
+
+$(RV_BUILD)/reference-heuristic.debug.elf: $(RV_BUILD)/heuristic-check.o $(RV_BUILD)/reference.o $(RV_BUILD)/reference-tables.o $(RV_BUILD)/heuristic-cases.o riscv/link.ld
+	$(RV_LD) -m elf32lriscv --no-relax --gc-sections -T riscv/link.ld -o "$@" \
+		$(RV_BUILD)/heuristic-check.o $(RV_BUILD)/reference.o \
+		$(RV_BUILD)/reference-tables.o $(RV_BUILD)/heuristic-cases.o
+
+$(RV_BUILD)/reference-heuristic.elf: $(RV_BUILD)/reference-heuristic.debug.elf
+	$(RV_OBJCOPY) --strip-all --remove-section=.riscv.attributes "$<" "$@"
+
+rv32i-reference-heuristic-check: $(RV_BUILD)/reference-heuristic.elf
+	$(PYTHON) riscv/check_heuristics.py "$(RIPES)" "$<" "$(RV_PROC)"
 
 rv32i-input-check: $(RV_BUILD)/smoke.elf
 	$(PYTHON) riscv/check_inputs.py --ripes "$(RIPES)" \
@@ -156,6 +218,13 @@ $(RV_BUILD)/calibration.elf: $(RV_BUILD)/calibration.debug.elf
 rv32i-calibration: $(RV_BUILD)/calibration.elf
 
 clean-rv32i:
+	$(RM) "$(RV_BUILD)/reference-rank.debug.elf" "$(RV_BUILD)/reference-rank.elf" \
+		"$(RV_BUILD)/reference-rank.report.json" "$(RV_BUILD)/reference-heuristic.debug.elf" \
+		"$(RV_BUILD)/reference-heuristic.elf" "$(RV_BUILD)/reference-heuristic.report.json"
+	$(RM) "$(RV_BUILD)/reference.o" "$(RV_BUILD)/reference-bridge.o" \
+		"$(RV_BUILD)/reference-tables.S" "$(RV_BUILD)/reference-tables.o" \
+		"$(RV_BUILD)/reference.debug.elf" "$(RV_BUILD)/reference.elf" \
+		"$(RV_BUILD)/reference.report.json"
 	$(RM) "$(RV_BUILD)/calibration.o" "$(RV_BUILD)/calibration.debug.elf" \
 		"$(RV_BUILD)/calibration.elf" "$(RV_BUILD)/calibration.audit.json"
 	$(RM) "$(RV_BUILD)/replay-check.o" "$(RV_BUILD)/replay-check.debug.elf" \

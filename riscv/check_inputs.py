@@ -73,8 +73,8 @@ def cases():
     return [(labels, data) for data, labels in unique.items()]
 
 
-def build_input(build, source):
-    command = ['make', '--no-print-directory', 'rv32i',
+def build_input(build, source, target='rv32i'):
+    command = ['make', '--no-print-directory', target,
                f'RV_BUILD={build}', f'RV_INPUT={source}']
     result = subprocess.run(command, capture_output=True, text=True, timeout=45)
     if result.returncode:
@@ -91,10 +91,11 @@ def run(args):
     if first < 0 or count <= 0 or first + count > len(suite):
         raise ValueError('Input-case range is outside the suite')
     build = Path(args.build)
+    elf = build / ('reference.elf' if args.target == 'rv32i-reference' else 'smoke.elf')
     directory = build / 'input-cases'
     directory.mkdir(exist_ok=True)
     records = []
-    output = build / f'input-check-{args.processor}-{first}-{first + count}.json'
+    output = build / f'{elf.stem}-input-check-{args.processor}-{first}-{first + count}.json'
     try:
         for index in range(first, first + count):
             labels, data = suite[index]
@@ -105,8 +106,8 @@ def run(args):
                               'cube_input:\n    .byte ' + values + '\n'
                               '.size cube_input, .-cube_input\n')
             before = time.perf_counter()
-            build_input(build, source)
-            evidence = check(args.ripes, str(build / 'smoke.elf'), args.processor,
+            build_input(build, source, args.target)
+            evidence = check(args.ripes, str(elf), args.processor,
                              args.sim_timeout)
             records.append({'index': index, 'labels': labels,
                             'object_input_hex': data.hex(),
@@ -118,8 +119,8 @@ def run(args):
             print(f'input case {index}: {labels[0]} passed', flush=True)
     finally:
         # Each case uses a generated object; never edit the user's input.S.
-        build_input(build, Path(args.input))
-        check(args.ripes, str(build / 'smoke.elf'), args.processor, args.sim_timeout)
+        build_input(build, Path(args.input), args.target)
+        check(args.ripes, str(elf), args.processor, args.sim_timeout)
     valid = sum(r['expected']['status'] == 0 for r in records)
     print(f'INPUT RANGE [{first},{first + count}) PASSED: '
           f'{valid} valid, {count - valid} invalid; '
@@ -134,6 +135,7 @@ if __name__ == '__main__':
     parser.add_argument('--sim-timeout', type=int, default=30000,
                         help='finite Ripes per-case timeout in milliseconds')
     parser.add_argument('--input', default='riscv/input.S')
+    parser.add_argument('--target', choices=('rv32i', 'rv32i-reference'), default='rv32i')
     parser.add_argument('--first', type=int, default=0)
     parser.add_argument('--count', type=int)
     parser.add_argument('--list', action='store_true')

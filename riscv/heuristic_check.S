@@ -52,6 +52,8 @@ _start:
     mv a0, s5
     li a7, 10
     ecall
+.Lhalt:
+    j .Lhalt
 .size _start, .-_start
 .section .rodata.heuristic_messages, "a", @progbits
 .Lpass_message:

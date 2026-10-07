@@ -1,7 +1,11 @@
 #include <stdint.h>
+#ifdef CUBE_RV32I_REFERENCE
+#include <stddef.h>
+#else
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#endif
 
 enum {
     CUBIES = 7,
@@ -110,7 +114,21 @@ static uint32_t rank_state(const state_t *state)
         for (uint8_t j = (uint8_t) (i + 1U); j < CUBIES; ++j)
             if (state->p[j] < state->p[i])
                 ++smaller;
+#ifdef CUBE_RV32I_REFERENCE
+        /* Exact Horner scaling without a variable multiply. */
+        switch (CUBIES - i) {
+        case 7: p = (p << 3) - p; break;
+        case 6: p = (p << 2) + (p << 1); break;
+        case 5: p = (p << 2) + p; break;
+        case 4: p <<= 2; break;
+        case 3: p = (p << 1) + p; break;
+        case 2: p <<= 1; break;
+        default: break;
+        }
+        p += smaller;
+#else
         p = p * (CUBIES - i) + smaller;
+#endif
     }
     /*@ loop invariant 0 <= i <= 6;
         loop invariant (i == 0 ==> o == 0) && (i == 1 ==> o < 3) &&
@@ -122,7 +140,12 @@ static uint32_t rank_state(const state_t *state)
      */
     for (uint8_t i = 0; i < 6; ++i)
         o = o * 3U + state->o[i];
+#ifdef CUBE_RV32I_REFERENCE
+    /* The ABI bridge splits this into a0=P and a1=Q. */
+    return p | (o << 16);
+#else
     return p * ORIENTATIONS + o;
+#endif
 }
 
 /*@ requires \valid(state); requires rank < STATES; assigns *state; */
@@ -190,13 +213,21 @@ static int valid(const state_t *state)
                 return 0;
         sum = (uint8_t) (sum + state->o[i]);
     }
+#ifdef CUBE_RV32I_REFERENCE
+    if (sum >= 12) sum -= 12;
+    if (sum >= 6) sum -= 6;
+    if (sum >= 3) sum -= 3;
+    return sum == 0;
+#else
     return sum % 3U == 0;
+#endif
 }
 
 /* P and Q advance independently. Store only quarter turns; repeated lookups
  * produce half and inverse turns, each of which still costs one HTM move.
  * The caller owns the 34,614 bytes of transition storage.
  */
+#ifndef CUBE_RV32I_REFERENCE
 static void build_transitions(uint16_t permutation[3][PERMUTATIONS],
                               uint16_t orientation[3][ORIENTATIONS])
 {
@@ -251,6 +282,8 @@ static int build_coordinate_distances(uint16_t count,
     return tail == count;
 }
 
+#endif
+
 /* Each projection drops constraints, so both distances are lower bounds.
  * Use max, not sum: the same move may improve both coordinates.
  */
@@ -273,8 +306,13 @@ typedef struct {
     uint8_t mixed_distance[MIXED_BYTES];
 } coordinate_tables_t;
 
+#ifdef CUBE_RV32I_REFERENCE
+extern coordinate_tables_t query_tables;
+#else
 static coordinate_tables_t query_tables;
+#endif
 
+#ifndef CUBE_RV32I_REFERENCE
 static int build_basic_tables(void)
 {
     uint16_t queue[PERMUTATIONS];
@@ -336,6 +374,8 @@ static int build_subset_tables(void)
     return 1;
 }
 
+#endif
+
 /* Even indices use the low nibble; odd indices use the high nibble.
  * Byte mode is retained for the host reference used by --self-test.
  */
@@ -347,6 +387,7 @@ static uint8_t mixed_get(const uint8_t *distance, uint32_t index, int packed)
     return (uint8_t) ((distance[index >> 1] >> shift) & 0x0FU);
 }
 
+#ifndef CUBE_RV32I_REFERENCE
 static void mixed_set(uint8_t *distance,
                       uint32_t index,
                       uint8_t value,
@@ -453,7 +494,7 @@ static void emit_byte_table(const char *name, const uint8_t *data, size_t count)
     printf(".size %s, .-%s\n\n", name, name);
 }
 
-static void emit_query_tables(void)
+static void emit_query_tables(int reference_layout)
 {
     const uint16_t *const permutation[3] = {
         query_tables.permutation[0], query_tables.permutation[1],
@@ -473,7 +514,18 @@ static void emit_query_tables(void)
                     ORIENTATIONS);
     emit_byte_table("cube_permutation_subset", query_tables.permutation_subset,
                     PERMUTATIONS);
+    if (reference_layout) {
+        for (uint8_t face = 0; face < 3; ++face) {
+            char name[32];
+            snprintf(name, sizeof name, "cube_subset_turn_%u", (unsigned) face);
+            emit_byte_table(name, query_tables.subset_turn[face], SUBSETS);
+        }
+    }
     emit_byte_table("cube_mixed_distance", query_tables.mixed_distance, MIXED_BYTES);
+    if (reference_layout)
+        printf(".globl query_tables\n.type query_tables, @object\n"
+               ".set query_tables, cube_permutation_turn\n.size query_tables, %lu\n",
+               (unsigned long) sizeof query_tables);
 }
 
 /* Ranking-only fixtures: all P at Q=0, then all remaining Q at P=0.
@@ -506,6 +558,8 @@ static int emit_rank_cases(void)
     return 1;
 }
 
+#endif
+
 static uint8_t query_heuristic(uint16_t p, uint16_t q)
 {
     uint8_t basic =
@@ -517,6 +571,7 @@ static uint8_t query_heuristic(uint16_t p, uint16_t q)
     return basic > mixed ? basic : mixed;
 }
 
+#ifndef CUBE_RV32I_REFERENCE
 static int emit_heuristic_cases(void)
 {
     uint16_t representatives[SUBSETS];
@@ -550,6 +605,8 @@ static int emit_heuristic_cases(void)
     emit_byte_table("cube_heuristic_expected", expected, sizeof expected);
     return 1;
 }
+
+#endif
 
 typedef struct {
     uint16_t p, q;
@@ -593,14 +650,20 @@ static int solve_coordinate(uint16_t p,
             if (stats && frame->next_move == 0)
                 ++stats->expanded[bound];
             uint8_t move = frame->next_move++;
+#ifdef CUBE_RV32I_REFERENCE
+            uint8_t face = move >= 6 ? 2 : move >= 3 ? 1 : 0;
+            uint8_t turn_limit = (uint8_t) (move - 3U * face);
+#else
             uint8_t face = (uint8_t) (move / 3U);
+            uint8_t turn_limit = (uint8_t) (move % 3U);
+#endif
             if (face == frame->previous_face) {
                 if (stats)
                     ++stats->same_face[bound];
                 continue;
             }
             uint16_t next_p = frame->p, next_q = frame->q;
-            for (uint8_t turn = 0; turn <= move % 3U; ++turn) {
+            for (uint8_t turn = 0; turn <= turn_limit; ++turn) {
                 next_p = query_tables.permutation[face][next_p];
                 next_q = query_tables.orientation[face][next_q];
             }
@@ -623,6 +686,7 @@ static int solve_coordinate(uint16_t p,
     return -1;
 }
 
+#ifndef CUBE_RV32I_REFERENCE
 static int replay_solution(state_t state,
                            const uint8_t path[MAX_DEPTH],
                            int length)
@@ -683,6 +747,8 @@ static uint8_t *build_table(uint8_t *diameter)
     return toward_solved;
 }
 
+#endif
+
 /*@ requires valid_read_string(input);
     requires \valid(state);
     assigns state->p[0..6], state->o[0..6];
@@ -717,11 +783,19 @@ static int parse_state(const char *input, state_t *state)
         int limit = i < 7 ? 7 : 3;
         if (input[i] < '1' || input[i] > '0' + limit)
             return 0;
+#ifdef CUBE_RV32I_REFERENCE
+        if (i < CUBIES)
+            state->p[i] = (uint8_t) (input[i] - '1');
+        else
+            state->o[i - CUBIES] = (uint8_t) (input[i] - '1');
+#else
         (i < 7 ? state->p : state->o)[i % 7] = (uint8_t) (input[i] - '1');
+#endif
     }
     return input[14] == '\0' && valid(state);
 }
 
+#ifndef CUBE_RV32I_REFERENCE
 /* stdout is fully buffered off a terminal, so a write error surfaces at the
  * flush, not at the printf that queued the bytes. Every exit path that has
  * produced output goes through here.
@@ -1241,12 +1315,13 @@ int main(int argc, char **argv)
         }
         return output_failed();
     }
-    if (argc == 2 && !strcmp(argv[1], "--emit-tables")) {
+    if (argc == 2 && (!strcmp(argv[1], "--emit-tables") ||
+                      !strcmp(argv[1], "--emit-reference-tables"))) {
         if (!build_query_tables()) {
             fputs("could not build coordinate tables\n", stderr);
             return 1;
         }
-        emit_query_tables();
+        emit_query_tables(!strcmp(argv[1], "--emit-reference-tables"));
         return output_failed();
     }
     if (argc == 2 && !strcmp(argv[1], "--self-test")) {
@@ -1352,3 +1427,4 @@ int main(int argc, char **argv)
     putchar('\n');
     return output_failed();
 }
+#endif

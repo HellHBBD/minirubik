@@ -35,6 +35,8 @@ _start:
     mv a0, s3
     li a7, 10
     ecall
+.Lhalt:
+    j .Lhalt
 .size _start, .-_start
 
 .section .rodata.rank_messages, "a", @progbits
