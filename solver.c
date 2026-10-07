@@ -905,7 +905,36 @@ static int self_test_search(const uint8_t *toward_solved,
     return 1;
 }
 
-static int parse_test_number(const char *input, uint16_t *number)
+/* Verify every state in a half-open rank interval. Small batches permit
+ * finite host runs without sampling or skipping states in the domain.
+ */
+static int self_test_range(const uint8_t *toward_solved,
+                           uint32_t first,
+                           uint32_t count)
+{
+    search_stats_t stats = {0};
+    uint32_t histogram[MAX_DEPTH + 1] = {0};
+    uint32_t end = first + count;
+    for (uint32_t rank = first; rank < end; ++rank) {
+        state_t state;
+        unrank_state(rank, &state);
+        int distance = oracle_distance(state, toward_solved);
+        if (distance < 0 || !check_search(state, distance, &stats))
+            return 0;
+        ++histogram[distance];
+    }
+    fprintf(stderr, "IDA* rank range [%lu,%lu): %lu states checked\n",
+            (unsigned long) first, (unsigned long) end, (unsigned long) count);
+    for (uint8_t distance = 0; distance <= MAX_DEPTH; ++distance)
+        fprintf(stderr, "distance %u: %lu states\n", (unsigned) distance,
+                (unsigned long) histogram[distance]);
+    print_search_stats(&stats);
+    return 1;
+}
+
+static int parse_test_number(const char *input,
+                             uint32_t limit,
+                             uint32_t *number)
 {
     uint32_t value = 0;
     if (!*input)
@@ -913,11 +942,14 @@ static int parse_test_number(const char *input, uint16_t *number)
     for (; *input; ++input) {
         if (*input < '0' || *input > '9')
             return 0;
-        value = value * 10U + (unsigned) (*input - '0');
-        if (value > HARDEST_STATES)
+        uint32_t digit = (uint32_t) (*input - '0');
+        /* Reject before multiplication, including arbitrarily long input. */
+        if (value > limit / 10U ||
+            (value == limit / 10U && digit > limit % 10U))
             return 0;
+        value = value * 10U + digit;
     }
-    *number = (uint16_t) value;
+    *number = value;
     return 1;
 }
 
@@ -951,9 +983,9 @@ int main(int argc, char **argv)
         return output_failed();
     }
     if (argc == 4 && !strcmp(argv[1], "--search-test")) {
-        uint16_t first, count;
-        if (!parse_test_number(argv[2], &first) ||
-            !parse_test_number(argv[3], &count) || count == 0 ||
+        uint32_t first, count;
+        if (!parse_test_number(argv[2], HARDEST_STATES, &first) ||
+            !parse_test_number(argv[3], HARDEST_STATES, &count) || count == 0 ||
             first + count > HARDEST_STATES) {
             fputs("usage: solver --search-test FIRST COUNT\n", stderr);
             return 2;
@@ -962,11 +994,34 @@ int main(int argc, char **argv)
         if (!table)
             return 1;
         int ok = diameter == MAX_DEPTH && build_query_tables() &&
-                 self_test_search(table, 1, first, count);
+                 self_test_search(table, 1, (uint16_t) first, (uint16_t) count);
         free(table);
         if (!ok)
             return 1;
         puts("distance-11 batch passed");
+        return output_failed();
+    }
+    if (argc == 4 && !strcmp(argv[1], "--verify-range")) {
+        uint32_t first, count;
+        if (!parse_test_number(argv[2], STATES, &first) ||
+            !parse_test_number(argv[3], STATES, &count) || count == 0 ||
+            count > STATES - first) {
+            fputs("usage: solver --verify-range FIRST COUNT\n", stderr);
+            return 2;
+        }
+        uint8_t *table = build_table(&diameter);
+        if (!table) {
+            fputs("could not build complete state table\n", stderr);
+            return 1;
+        }
+        int ok = diameter == MAX_DEPTH && build_query_tables() &&
+                 self_test_range(table, first, count);
+        free(table);
+        if (!ok) {
+            fputs("rank-range check failed\n", stderr);
+            return 1;
+        }
+        puts("rank range passed");
         return output_failed();
     }
     if (argc != 2 || !parse_state(argv[1], &state)) {
