@@ -10,6 +10,8 @@ RV_INPUT ?= riscv/input.S
 RIPES ?= /usr/bin/ripes
 RV_PROC ?= RV32_ISS
 PYTHON ?= python3
+RV_CAL_BYTES ?= 65536
+RV_CAL_PASSES ?= 1
 CLANG_FORMAT := $(shell command -v clang-format-20 2>/dev/null || \
 	command -v clang-format 2>/dev/null)
 C_SOURCES := $(wildcard *.c *.h)
@@ -138,7 +140,24 @@ $(RV_BUILD)/replay-check.elf: $(RV_BUILD)/replay-check.debug.elf
 rv32i-replay-check: $(RV_BUILD)/replay-check.elf
 	$(PYTHON) riscv/check_replay.py "$(RIPES)" "$<" "$(RV_PROC)"
 
+.PHONY: rv32i-calibration force-rv-calibration
+force-rv-calibration:
+
+$(RV_BUILD)/calibration.o: riscv/calibration.S force-rv-calibration | $(RV_BUILD)
+	$(RV_CC) $(RV_ASFLAGS) -DCAL_BYTES=$(RV_CAL_BYTES) \
+		-DCAL_PASSES=$(RV_CAL_PASSES) -c "$<" -o "$@"
+
+$(RV_BUILD)/calibration.debug.elf: $(RV_BUILD)/calibration.o riscv/link.ld
+	$(RV_LD) -m elf32lriscv --no-relax -T riscv/link.ld -o "$@" $(RV_BUILD)/calibration.o
+
+$(RV_BUILD)/calibration.elf: $(RV_BUILD)/calibration.debug.elf
+	$(RV_OBJCOPY) --strip-all --remove-section=.riscv.attributes "$<" "$@"
+
+rv32i-calibration: $(RV_BUILD)/calibration.elf
+
 clean-rv32i:
+	$(RM) "$(RV_BUILD)/calibration.o" "$(RV_BUILD)/calibration.debug.elf" \
+		"$(RV_BUILD)/calibration.elf" "$(RV_BUILD)/calibration.audit.json"
 	$(RM) "$(RV_BUILD)/replay-check.o" "$(RV_BUILD)/replay-check.debug.elf" \
 		"$(RV_BUILD)/replay-check.elf" $(wildcard $(RV_BUILD)/replay-check.*.report.json)
 	$(RM) "$(RV_BUILD)/move.o" "$(RV_BUILD)/search.o" \
