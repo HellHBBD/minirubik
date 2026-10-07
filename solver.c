@@ -12,7 +12,8 @@ enum {
     MAX_DEPTH = 11,
     HARDEST_STATES = 2644,
     SUBSETS = 35,
-    MIXED_STATES = SUBSETS * ORIENTATIONS
+    MIXED_STATES = SUBSETS * ORIENTATIONS,
+    MIXED_BYTES = (MIXED_STATES + 1) / 2
 };
 
 typedef struct {
@@ -269,7 +270,7 @@ typedef struct {
     uint8_t orientation_distance[ORIENTATIONS];
     uint8_t permutation_subset[PERMUTATIONS];
     uint8_t subset_turn[3][SUBSETS];
-    uint8_t mixed_distance[MIXED_STATES];
+    uint8_t mixed_distance[MIXED_BYTES];
 } coordinate_tables_t;
 
 static coordinate_tables_t query_tables;
@@ -335,15 +336,41 @@ static int build_subset_tables(void)
     return 1;
 }
 
-static int build_mixed_distances(void)
+/* Even indices use the low nibble; odd indices use the high nibble.
+ * Byte mode is retained for the host reference used by --self-test.
+ */
+static uint8_t mixed_get(const uint8_t *distance, uint32_t index, int packed)
+{
+    if (!packed)
+        return distance[index];
+    unsigned shift = (index & 1U) * 4U;
+    return (uint8_t) ((distance[index >> 1] >> shift) & 0x0FU);
+}
+
+static void mixed_set(uint8_t *distance,
+                      uint32_t index,
+                      uint8_t value,
+                      int packed)
+{
+    if (!packed) {
+        distance[index] = value;
+        return;
+    }
+    unsigned shift = (index & 1U) * 4U;
+    uint8_t old = distance[index >> 1];
+    distance[index >> 1] =
+        (uint8_t) ((old & ~(0x0FU << shift)) | ((unsigned) value << shift));
+}
+
+static int build_mixed_distances(uint8_t *distance, int packed)
 {
     uint16_t queue[MIXED_STATES];
     uint16_t head = 0, tail = 1;
-    uint8_t *distance = query_tables.mixed_distance;
+    uint8_t unvisited = packed ? 0x0F : UINT8_MAX;
     uint16_t goal =
         (uint16_t) (query_tables.permutation_subset[0] * ORIENTATIONS);
-    memset(distance, UINT8_MAX, MIXED_STATES);
-    distance[goal] = 0;
+    memset(distance, UINT8_MAX, packed ? MIXED_BYTES : MIXED_STATES);
+    mixed_set(distance, goal, 0, packed);
     queue[0] = goal;
     while (head < tail) {
         uint16_t here = queue[head++];
@@ -357,21 +384,35 @@ static int build_mixed_distances(void)
                 next_q = query_tables.orientation[face][next_q];
                 uint16_t there =
                     (uint16_t) (next_subset * ORIENTATIONS + next_q);
-                if (distance[there] == UINT8_MAX) {
-                    distance[there] = (uint8_t) (distance[here] + 1U);
+                if (mixed_get(distance, there, packed) == unvisited) {
+                    uint8_t next_distance =
+                        (uint8_t) (mixed_get(distance, here, packed) + 1U);
+                    /* C4 measured maximum 8. Reserve 15 as the packed
+                     * sentinel and reject any distance that would collide.
+                     */
+                    if (next_distance >= unvisited)
+                        return 0;
+                    mixed_set(distance, there, next_distance, packed);
                     queue[tail++] = there;
                 }
             }
         }
     }
-    return tail == MIXED_STATES;
+    if (tail != MIXED_STATES)
+        return 0;
+    /* The final entry uses the low nibble of the last byte. Canonicalize
+     * the unused high nibble only after BFS has visited every entry.
+     */
+    if (packed && (MIXED_STATES & 1U))
+        distance[MIXED_BYTES - 1] &= 0x0FU;
+    return 1;
 }
 
 static int build_query_tables(void)
 {
     /* Separate calls keep the basic and mixed BFS scratch lifetimes apart. */
     return build_basic_tables() && build_subset_tables() &&
-           build_mixed_distances();
+           build_mixed_distances(query_tables.mixed_distance, 1);
 }
 
 static uint8_t query_heuristic(uint16_t p, uint16_t q)
@@ -381,7 +422,7 @@ static uint8_t query_heuristic(uint16_t p, uint16_t q)
                              query_tables.orientation_distance);
     uint32_t index =
         (uint32_t) query_tables.permutation_subset[p] * ORIENTATIONS + q;
-    uint8_t mixed = query_tables.mixed_distance[index];
+    uint8_t mixed = mixed_get(query_tables.mixed_distance, index, 1);
     return basic > mixed ? basic : mixed;
 }
 
@@ -605,7 +646,32 @@ static int self_test(void)
 static int self_test_mixed(void)
 {
     uint8_t masks[SUBSETS] = {0};
+    uint8_t byte_distance[MIXED_STATES];
     uint8_t maximum = 0;
+    /* Exercise nibble isolation for every representable value, including
+     * the unvisited sentinel. The adjacent byte must remain untouched.
+     */
+    for (uint8_t low = 0; low < 16; ++low) {
+        for (uint8_t high = 0; high < 16; ++high) {
+            uint8_t pair[2] = {UINT8_MAX, 0xA5};
+            mixed_set(pair, 0, low, 1);
+            if (mixed_get(pair, 1, 1) != 0x0F)
+                return 0;
+            mixed_set(pair, 1, high, 1);
+            if (mixed_get(pair, 0, 1) != low ||
+                mixed_get(pair, 1, 1) != high || pair[1] != 0xA5)
+                return 0;
+            mixed_set(pair, 0, (uint8_t) (15U - low), 1);
+            if (mixed_get(pair, 0, 1) != 15U - low ||
+                mixed_get(pair, 1, 1) != high || pair[1] != 0xA5)
+                return 0;
+        }
+    }
+    if (!build_mixed_distances(byte_distance, 0))
+        return 0;
+    if ((MIXED_STATES & 1U) &&
+        (query_tables.mixed_distance[MIXED_BYTES - 1] & 0xF0U))
+        return 0;
     /* Recover each label's mask from cubie states, independently of the
      * builder's mask enumeration. A label must describe exactly one mask.
      */
@@ -642,7 +708,9 @@ static int self_test_mixed(void)
     uint16_t goal =
         (uint16_t) (query_tables.permutation_subset[0] * ORIENTATIONS);
     for (uint16_t index = 0; index < MIXED_STATES; ++index) {
-        uint8_t distance = query_tables.mixed_distance[index];
+        uint8_t distance = mixed_get(query_tables.mixed_distance, index, 1);
+        if (byte_distance[index] >= 0x0F || distance != byte_distance[index])
+            return 0;
         if (distance > MAX_DEPTH || ((distance == 0) != (index == goal)))
             return 0;
         int descends = index == goal;
@@ -653,7 +721,7 @@ static int self_test_mixed(void)
                 subset = query_tables.subset_turn[face][subset];
                 q = query_tables.orientation[face][q];
                 uint16_t next = (uint16_t) (subset * ORIENTATIONS + q);
-                uint8_t neighbor = query_tables.mixed_distance[next];
+                uint8_t neighbor = mixed_get(query_tables.mixed_distance, next, 1);
                 if (distance > neighbor + 1U)
                     return 0;
                 if (distance == neighbor + 1U)
@@ -667,7 +735,7 @@ static int self_test_mixed(void)
     }
     fprintf(stderr,
             "mixed PDB: cubies {0,1,2}; 25515 entries; maximum %u; "
-            "projection and abstract distances checked\n",
+            "projection, byte/packed equality and abstract distances checked\n",
             (unsigned) maximum);
     return 1;
 }
