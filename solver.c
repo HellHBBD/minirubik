@@ -1018,6 +1018,14 @@ int main(int argc, char **argv)
 {
     state_t state;
     uint8_t diameter;
+    /* Binary parse oracle for the assembly input checkpoint: p[7], o[7]. */
+    if (argc == 3 && !strcmp(argv[1], "--parse-state")) {
+        if (!parse_state(argv[2], &state))
+            return 2;
+        fwrite(state.p, 1, CUBIES, stdout);
+        fwrite(state.o, 1, CUBIES, stdout);
+        return output_failed();
+    }
     if (argc == 2 && !strcmp(argv[1], "--emit-tables")) {
         if (!build_query_tables()) {
             fputs("could not build coordinate tables\n", stderr);

@@ -1,6 +1,8 @@
-/* A1: data-transfer smoke test. This entry is not the cube search yet.
+/* A2: table-transfer and input-validation checkpoint.
  * Ripes services: a7=4 prints the string at a0; a7=10 terminates.
- * s0 records status (0=pass, 1=fail), copied to a0 before termination.
+ * s0 records status (0=valid, 1=checkpoint failure, 2=invalid input).
+ * s1/s2 expose parsed bytes as fixed-width base-8/base-4 fingerprints;
+ * these diagnostics are not the Lehmer P or base-3 Q coordinates.
  */
 .option norvc
 .option norelax
@@ -9,6 +11,8 @@
 .type _start, @function
 _start:
     la sp, __stack_top
+    li s1, 0
+    li s2, 0
     la t0, cube_permutation_turn
     la t1, cube_orientation_turn
 
@@ -50,8 +54,33 @@ _start:
     andi t1, t1, 15
     bnez t1, .Lfail
 
-    li s0, 0
+    la a0, cube_input
+    la a1, cube_state
+    jal ra, cube_parse_state
+    mv s0, a0
+    bnez a0, .Linvalid_input
+
+    /* Expose all fourteen parsed bytes for the host checker. */
+    la t0, cube_state
+    li t1, 7
+.Lfingerprint:
+    lbu t2, 0(t0)
+    li t4, 7
+    bgeu t2, t4, .Lfail
+    slli s1, s1, 3
+    or s1, s1, t2
+    lbu t3, 7(t0)
+    li t4, 3
+    bgeu t3, t4, .Lfail
+    slli s2, s2, 2
+    or s2, s2, t3
+    addi t0, t0, 1
+    addi t1, t1, -1
+    bnez t1, .Lfingerprint
     la a0, .Lpass_message
+    j .Lreport
+.Linvalid_input:
+    la a0, .Linvalid_message
     j .Lreport
 .Lfail:
     li s0, 1
@@ -66,9 +95,19 @@ _start:
 
 .section .rodata.smoke, "a", @progbits
 .Lpass_message:
-    .asciz "RV32I tables ready\n"
+    .asciz "RV32I input valid\n"
+.Linvalid_message:
+    .asciz "RV32I input invalid\n"
 .Lfail_message:
-    .asciz "RV32I table check failed\n"
+    .asciz "RV32I checkpoint failed\n"
+
+.section .bss.cube_state, "aw", @nobits
+.balign 4
+.globl cube_state
+.type cube_state, @object
+cube_state:
+    .space 14
+.size cube_state, .-cube_state
 
 .section .bss.stack, "aw", @nobits
 .balign 16
