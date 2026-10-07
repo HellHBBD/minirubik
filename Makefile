@@ -1,6 +1,15 @@
 CC ?= cc
 CFLAGS ?= -O3 -std=c99 -Wall -Wextra -Wpedantic
 FRAMA_C ?= frama-c
+RV_CC ?= clang
+RV_LD ?= ld.lld
+RV_OBJCOPY ?= llvm-objcopy
+RV_ASFLAGS ?= --target=riscv32-unknown-elf -march=rv32i -mabi=ilp32
+RV_BUILD ?= build-rv32i
+RV_INPUT ?= riscv/input.S
+RIPES ?= /usr/bin/ripes
+RV_PROC ?= RV32_SS
+PYTHON ?= python3
 CLANG_FORMAT := $(shell command -v clang-format-20 2>/dev/null || \
 	command -v clang-format 2>/dev/null)
 C_SOURCES := $(wildcard *.c *.h)
@@ -12,7 +21,7 @@ VECTORS := tests/solutions.txt
 INVALID_STATES := 1234567111111 123456711111111 02345671111111 82345671111111 \
 	12345671111110 12345671111114 1234567111111a 11345671111111 12345671111112
 
-.PHONY: all check prove clean indent
+.PHONY: all check prove clean indent rv32i rv32i-smoke clean-rv32i force-rv-input
 
 all: solver mini
 
@@ -21,6 +30,41 @@ solver: solver.c
 
 mini: mini.c
 	$(CC) $(CFLAGS) $< -o $@
+
+rv32i: $(RV_BUILD)/smoke.elf
+
+$(RV_BUILD):
+	mkdir -p "$@"
+
+$(RV_BUILD)/tables.S: solver | $(RV_BUILD)
+	./solver --emit-tables >"$@"
+
+$(RV_BUILD)/tables.o: $(RV_BUILD)/tables.S
+	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+
+$(RV_BUILD)/entry.o: riscv/entry.S | $(RV_BUILD)
+	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+
+force-rv-input:
+
+$(RV_BUILD)/input.o: $(RV_INPUT) force-rv-input | $(RV_BUILD)
+	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+
+$(RV_BUILD)/smoke.debug.elf: $(RV_BUILD)/entry.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o riscv/link.ld
+	$(RV_LD) -m elf32lriscv --no-relax -T riscv/link.ld -o "$@" \
+		$(RV_BUILD)/entry.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o
+
+$(RV_BUILD)/smoke.elf: $(RV_BUILD)/smoke.debug.elf
+	$(RV_OBJCOPY) --strip-all --remove-section=.riscv.attributes "$<" "$@"
+
+rv32i-smoke: $(RV_BUILD)/smoke.elf
+	$(PYTHON) riscv/check_smoke.py "$(RIPES)" "$<" "$(RV_PROC)"
+
+clean-rv32i:
+	$(RM) "$(RV_BUILD)/tables.S" "$(RV_BUILD)/tables.o" \
+		"$(RV_BUILD)/entry.o" "$(RV_BUILD)/input.o" \
+		"$(RV_BUILD)/smoke.debug.elf" "$(RV_BUILD)/smoke.elf" \
+		"$(RV_BUILD)/smoke.report.json"
 
 check: solver mini $(VECTORS)
 	./solver --self-test
