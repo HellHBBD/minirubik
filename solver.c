@@ -865,6 +865,102 @@ static int self_test_mixed(void)
     return 1;
 }
 
+/* H2: report coverage and bounds without conflating transition values with
+ * distances. Every turn row must be a bijection of its coordinate domain.
+ */
+static int report_turn_table(const char *name, uint16_t count,
+                             uint16_t turns[3][count])
+{
+    uint8_t seen[PERMUTATIONS];
+    uint16_t maximum = 0;
+    for (uint8_t face = 0; face < 3; ++face) {
+        memset(seen, 0, count);
+        for (uint16_t i = 0; i < count; ++i) {
+            uint16_t value = turns[face][i];
+            if (value >= count || seen[value])
+                return 0;
+            seen[value] = 1;
+            if (value > maximum)
+                maximum = value;
+        }
+    }
+    fprintf(stderr, "H2 %s: entries %u; populated %u; maximum %u; "
+                    "solved turns %u,%u,%u; bytes %u\n",
+            name, 3U * count, 3U * count, (unsigned) maximum,
+            (unsigned) turns[0][0], (unsigned) turns[1][0],
+            (unsigned) turns[2][0], 6U * count);
+    return 1;
+}
+
+static int report_distance_table(const char *name, const uint8_t *data,
+                                 uint16_t count, uint16_t goal, int packed,
+                                 unsigned bytes)
+{
+    uint8_t maximum = 0;
+    for (uint16_t i = 0; i < count; ++i) {
+        uint8_t value = mixed_get(data, i, packed);
+        if (value > MAX_DEPTH || ((value == 0) != (i == goal)))
+            return 0;
+        if (value > maximum)
+            maximum = value;
+    }
+    fprintf(stderr, "H2 %s: entries %u; populated %u; maximum %u; "
+                    "solved index %u value 0; bytes %u\n",
+            name, (unsigned) count, (unsigned) count, (unsigned) maximum,
+            (unsigned) goal, bytes);
+    return 1;
+}
+
+static int self_test_table_report(void)
+{
+    const state_t solved = {{0, 1, 2, 3, 4, 5, 6}, {0}};
+    for (uint8_t face = 0; face < 3; ++face) {
+        state_t next = quarter_turn(solved, face);
+        uint32_t rank = rank_state(&next);
+        if (query_tables.permutation[face][0] != rank / ORIENTATIONS ||
+            query_tables.orientation[face][0] != rank % ORIENTATIONS)
+            return 0;
+    }
+    if (!report_turn_table("permutation_turn", PERMUTATIONS, query_tables.permutation) ||
+        !report_turn_table("orientation_turn", ORIENTATIONS, query_tables.orientation) ||
+        !report_distance_table("permutation_distance", query_tables.permutation_distance,
+                               PERMUTATIONS, 0, 0, PERMUTATIONS) ||
+        !report_distance_table("orientation_distance", query_tables.orientation_distance,
+                               ORIENTATIONS, 0, 0, ORIENTATIONS))
+        return 0;
+    uint16_t fibers[SUBSETS] = {0};
+    for (uint16_t p = 0; p < PERMUTATIONS; ++p) {
+        uint8_t subset = query_tables.permutation_subset[p];
+        if (subset >= SUBSETS)
+            return 0;
+        ++fibers[subset];
+    }
+    for (uint8_t subset = 0; subset < SUBSETS; ++subset)
+        if (fibers[subset] != PERMUTATIONS / SUBSETS)
+            return 0;
+    fprintf(stderr, "H2 permutation_subset: entries 5040; populated 5040; "
+                    "maximum 34; solved value %u; bytes 5040; fibers 35x144\n",
+            (unsigned) query_tables.permutation_subset[0]);
+    for (uint8_t face = 0; face < 3; ++face) {
+        uint8_t seen[SUBSETS] = {0};
+        for (uint8_t subset = 0; subset < SUBSETS; ++subset) {
+            uint8_t value = query_tables.subset_turn[face][subset];
+            if (value >= SUBSETS || seen[value])
+                return 0;
+            seen[value] = 1;
+        }
+    }
+    uint8_t solved_subset = query_tables.permutation_subset[0];
+    fprintf(stderr, "H2 subset_turn (host-only): entries 105; populated 105; "
+                    "maximum 34; solved turns %u,%u,%u; bytes 105\n",
+            (unsigned) query_tables.subset_turn[0][solved_subset],
+            (unsigned) query_tables.subset_turn[1][solved_subset],
+            (unsigned) query_tables.subset_turn[2][solved_subset]);
+    return report_distance_table("mixed_distance", query_tables.mixed_distance,
+                                  MIXED_STATES, solved_subset * ORIENTATIONS,
+                                  1, MIXED_BYTES);
+}
+
 /* Only the host self-test uses the exhaustive oracle. Walk its stored moves
  * with the cubie model to obtain an exact distance independently of the new
  * abstract BFS. This also checks that each oracle path actually solves.
@@ -933,6 +1029,35 @@ static int oracle_distance(state_t state, const uint8_t *toward_solved)
         ++distance;
     }
     return distance;
+}
+
+/* Host-only exact BFS corpus. The target still searches each input itself. */
+static int emit_hardest_cases(const uint8_t *toward_solved)
+{
+    uint32_t histogram[MAX_DEPTH + 1] = {0};
+    uint32_t count = 0;
+    for (uint32_t rank = 0; rank < STATES; ++rank) {
+        state_t state;
+        unrank_state(rank, &state);
+        int distance = oracle_distance(state, toward_solved);
+        if (distance < 0)
+            return 0;
+        ++histogram[distance];
+        if (distance == MAX_DEPTH) {
+            printf("%lu %lu ", (unsigned long) count++, (unsigned long) rank);
+            for (uint8_t i = 0; i < CUBIES; ++i)
+                putchar('1' + state.p[i]);
+            for (uint8_t i = 0; i < CUBIES; ++i)
+                putchar('1' + state.o[i]);
+            printf(" %d\n", distance);
+        }
+    }
+    for (uint8_t distance = 0; distance <= MAX_DEPTH; ++distance)
+        fprintf(stderr, "exact BFS distance %u: %lu states\n",
+                (unsigned) distance, (unsigned long) histogram[distance]);
+    fprintf(stderr, "exact BFS hardest corpus: %lu states; ascending rank; "
+                    "domain 3674160; diameter 11\n", (unsigned long) count);
+    return count == HARDEST_STATES;
 }
 
 static int check_search(state_t state, int expected, search_stats_t *stats)
@@ -1139,7 +1264,7 @@ int main(int argc, char **argv)
             fputs("BFS check failed\n", stderr);
             return 1;
         }
-        if (!build_query_tables() || !self_test_mixed() ||
+        if (!build_query_tables() || !self_test_mixed() || !self_test_table_report() ||
             !self_test_heuristic(table) || !self_test_search(table, 0, 0, 0)) {
             free(table);
             fputs("coordinate solver check failed\n", stderr);
@@ -1147,6 +1272,16 @@ int main(int argc, char **argv)
         }
         free(table);
         puts("3674160 states; diameter 11");
+        return output_failed();
+    }
+    if (argc == 2 && !strcmp(argv[1], "--emit-hardest-cases")) {
+        uint8_t *table = build_table(&diameter);
+        if (!table)
+            return 1;
+        int ok = diameter == MAX_DEPTH && emit_hardest_cases(table);
+        free(table);
+        if (!ok)
+            return 1;
         return output_failed();
     }
     if (argc == 4 && !strcmp(argv[1], "--search-test")) {

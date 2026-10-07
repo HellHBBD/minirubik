@@ -70,11 +70,12 @@ def replay(state, path):
     return p == list(range(7)) and o == [0] * 7
 
 
-def check(ripes, elf, processor, sim_timeout=30000):
+def check(ripes, elf, processor, sim_timeout=30000, quiet=False, solver='./solver'):
     if sim_timeout <= 0:
         raise ValueError('Ripes timeout must be positive')
     input_bytes, stack_top = external_input(elf)
-    native = subprocess.run([b'./solver', b'--parse-state', input_bytes],
+    native_executable = os.fsencode(solver)
+    native = subprocess.run([native_executable, b'--parse-state', input_bytes],
                             capture_output=True, timeout=15)
     if native.returncode not in (0, 2):
         raise ValueError(f'Native parse oracle failed: {native.stderr!r}')
@@ -84,7 +85,7 @@ def check(ripes, elf, processor, sim_timeout=30000):
             raise ValueError('Native parse oracle did not produce fourteen bytes')
         expected['permutation_fingerprint'] = fingerprint(native.stdout[:7], 3)
         expected['orientation_fingerprint'] = fingerprint(native.stdout[7:], 2)
-        ranked = subprocess.run([b'./solver', b'--rank-state', input_bytes],
+        ranked = subprocess.run([native_executable, b'--rank-state', input_bytes],
                                 capture_output=True, timeout=15)
         if ranked.returncode != 0:
             raise ValueError('Native rank oracle failed')
@@ -92,12 +93,12 @@ def check(ripes, elf, processor, sim_timeout=30000):
         if not (0 <= p < 5040 and 0 <= q < 729):
             raise ValueError('Native rank oracle returned invalid coordinates')
         expected['p'], expected['q'] = p, q
-        h = subprocess.run([b'./solver', b'--heuristic-state', input_bytes],
+        h = subprocess.run([native_executable, b'--heuristic-state', input_bytes],
                            capture_output=True, timeout=15)
         if h.returncode != 0:
             raise ValueError('Native heuristic oracle failed')
         expected['h'] = int(h.stdout)
-        solved = subprocess.run([b'./solver', input_bytes], capture_output=True, timeout=15)
+        solved = subprocess.run([native_executable, input_bytes], capture_output=True, timeout=15)
         if solved.returncode != 0:
             raise ValueError('Native solution oracle failed')
         expected['length'] = len(solved.stdout.split())
@@ -170,12 +171,14 @@ def check(ripes, elf, processor, sim_timeout=30000):
     if report['runinfo']['ISA extensions'] != []:
         raise ValueError('Smoke test requires base RV32I without extensions')
     evidence = {'command': command, 'expected': expected, 'path': path,
-                'guest_output': output, 'raw_guest_output': raw_output, 'report': report}
+                'native_solver': str(solver), 'guest_output': output,
+                'raw_guest_output': raw_output, 'report': report}
     Path(elf).with_suffix('.report.json').write_text(
         json.dumps(evidence, indent=2) + '\n')
-    print(f'RV32I smoke passed: {processor}, '
-          f'{report["# instructions retired"]} instructions retired, '
-          f'input status={native.returncode}, parsed bytes and P/Q ranks match')
+    if not quiet:
+        print(f'RV32I smoke passed: {processor}, '
+              f'{report["# instructions retired"]} instructions retired, '
+              f'input status={native.returncode}, parsed bytes and P/Q ranks match')
     return evidence
 
 
