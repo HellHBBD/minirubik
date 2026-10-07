@@ -1,8 +1,9 @@
-/* A2: table-transfer and input-validation checkpoint.
+/* A3: table-transfer, parsing and P/Q ranking checkpoint.
  * Ripes services: a7=4 prints the string at a0; a7=10 terminates.
  * s0 records status (0=valid, 1=checkpoint failure, 2=invalid input).
  * s1/s2 expose parsed bytes as fixed-width base-8/base-4 fingerprints;
  * these diagnostics are not the Lehmer P or base-3 Q coordinates.
+ * s3/s4 expose the actual P/Q coordinates after a successful parse.
  */
 .option norvc
 .option norelax
@@ -13,6 +14,8 @@ _start:
     la sp, __stack_top
     li s1, 0
     li s2, 0
+    li s3, 0
+    li s4, 0
     la t0, cube_permutation_turn
     la t1, cube_orientation_turn
 
@@ -77,6 +80,14 @@ _start:
     addi t0, t0, 1
     addi t1, t1, -1
     bnez t1, .Lfingerprint
+    la a0, cube_state
+    jal ra, cube_rank_state
+    mv s3, a0
+    mv s4, a1
+    li t0, 5040
+    bgeu s3, t0, .Lfail
+    li t0, 729
+    bgeu s4, t0, .Lfail
     la a0, .Lpass_message
     j .Lreport
 .Linvalid_input:

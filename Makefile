@@ -21,7 +21,7 @@ VECTORS := tests/solutions.txt
 INVALID_STATES := 1234567111111 123456711111111 02345671111111 82345671111111 \
 	12345671111110 12345671111114 1234567111111a 11345671111111 12345671111112
 
-.PHONY: all check prove clean indent rv32i rv32i-smoke rv32i-input-check clean-rv32i force-rv-input
+.PHONY: all check prove clean indent rv32i rv32i-smoke rv32i-input-check rv32i-rank-check clean-rv32i force-rv-input
 
 all: solver mini
 
@@ -48,14 +48,17 @@ $(RV_BUILD)/entry.o: riscv/entry.S | $(RV_BUILD)
 $(RV_BUILD)/parse.o: riscv/parse.S | $(RV_BUILD)
 	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
 
+$(RV_BUILD)/rank.o: riscv/rank.S | $(RV_BUILD)
+	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+
 force-rv-input:
 
 $(RV_BUILD)/input.o: $(RV_INPUT) force-rv-input | $(RV_BUILD)
 	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
 
-$(RV_BUILD)/smoke.debug.elf: $(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o riscv/link.ld
+$(RV_BUILD)/smoke.debug.elf: $(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o riscv/link.ld
 	$(RV_LD) -m elf32lriscv --no-relax -T riscv/link.ld -o "$@" \
-		$(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o
+		$(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o
 
 $(RV_BUILD)/smoke.elf: $(RV_BUILD)/smoke.debug.elf
 	$(RV_OBJCOPY) --strip-all --remove-section=.riscv.attributes "$<" "$@"
@@ -67,11 +70,33 @@ rv32i-input-check: $(RV_BUILD)/smoke.elf
 	$(PYTHON) riscv/check_inputs.py --ripes "$(RIPES)" \
 		--build "$(RV_BUILD)" --processor "$(RV_PROC)" --input "$(RV_INPUT)"
 
+$(RV_BUILD)/rank-cases.S: solver | $(RV_BUILD)
+	./solver --emit-rank-cases >"$@"
+
+$(RV_BUILD)/rank-cases.o: $(RV_BUILD)/rank-cases.S
+	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+
+$(RV_BUILD)/rank-check.o: riscv/rank_check.S | $(RV_BUILD)
+	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+
+$(RV_BUILD)/rank-check.debug.elf: $(RV_BUILD)/rank-check.o $(RV_BUILD)/rank.o $(RV_BUILD)/rank-cases.o riscv/link.ld
+	$(RV_LD) -m elf32lriscv --no-relax -T riscv/link.ld -o "$@" \
+		$(RV_BUILD)/rank-check.o $(RV_BUILD)/rank.o $(RV_BUILD)/rank-cases.o
+
+$(RV_BUILD)/rank-check.elf: $(RV_BUILD)/rank-check.debug.elf
+	$(RV_OBJCOPY) --strip-all --remove-section=.riscv.attributes "$<" "$@"
+
+rv32i-rank-check: $(RV_BUILD)/rank-check.elf
+	$(PYTHON) riscv/check_ranks.py "$(RIPES)" "$<" "$(RV_PROC)"
+
 clean-rv32i:
 	$(RM) "$(RV_BUILD)/tables.S" "$(RV_BUILD)/tables.o" \
-		"$(RV_BUILD)/entry.o" "$(RV_BUILD)/parse.o" "$(RV_BUILD)/input.o" \
+		"$(RV_BUILD)/entry.o" "$(RV_BUILD)/parse.o" "$(RV_BUILD)/rank.o" "$(RV_BUILD)/input.o" \
 		"$(RV_BUILD)/smoke.debug.elf" "$(RV_BUILD)/smoke.elf" \
 		"$(RV_BUILD)/smoke.report.json"
+	$(RM) "$(RV_BUILD)/rank-cases.S" "$(RV_BUILD)/rank-cases.o" \
+		"$(RV_BUILD)/rank-check.o" "$(RV_BUILD)/rank-check.debug.elf" \
+		"$(RV_BUILD)/rank-check.elf" "$(RV_BUILD)/rank-check.report.json"
 
 check: solver mini $(VECTORS)
 	./solver --self-test

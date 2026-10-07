@@ -8,8 +8,8 @@ import sys
 from pathlib import Path
 
 
-def external_input(elf):
-    """Read cube_input and stack symbols from the matching debug ELF."""
+def debug_image(elf):
+    """Read sections and symbols from the matching little-endian debug ELF."""
     data = Path(elf).with_suffix('.debug.elf').read_bytes()
     if data[:7] != b'\x7fELF\x01\x01\x01':
         raise ValueError('Input checkpoint requires a little-endian ELF32')
@@ -27,13 +27,24 @@ def external_input(elf):
             name, address, size, _, _, index = struct.unpack_from('<IIIBBH', data, at)
             end = names.index(b'\0', name)
             symbols[names[name:end].decode()] = (address, size, index)
-    address, size, index = symbols['cube_input']
+    return data, sections, symbols
+
+
+def object_data(image, name):
+    data, sections, symbols = image
+    address, size, index = symbols[name]
     section = sections[index]
     at = section[4] + address - section[3]
-    raw = data[at:at + size]
+    return data[at:at + size]
+
+
+def external_input(elf):
+    """Read cube_input and stack symbols from the matching debug ELF."""
+    image = debug_image(elf)
+    raw = object_data(image, 'cube_input')
     if b'\0' not in raw:
         raise ValueError('cube_input must contain a NUL-terminated string')
-    return raw.split(b'\0', 1)[0], symbols['__stack_top'][0]
+    return raw.split(b'\0', 1)[0], image[2]['__stack_top'][0]
 
 
 def fingerprint(values, bits):
@@ -55,11 +66,20 @@ def check(ripes, elf, processor):
             raise ValueError('Native parse oracle did not produce fourteen bytes')
         expected['permutation_fingerprint'] = fingerprint(native.stdout[:7], 3)
         expected['orientation_fingerprint'] = fingerprint(native.stdout[7:], 2)
+        ranked = subprocess.run([b'./solver', b'--rank-state', input_bytes],
+                                capture_output=True, timeout=15)
+        if ranked.returncode != 0:
+            raise ValueError('Native rank oracle failed')
+        p, q = map(int, ranked.stdout.split())
+        if not (0 <= p < 5040 and 0 <= q < 729):
+            raise ValueError('Native rank oracle returned invalid coordinates')
+        expected['p'], expected['q'] = p, q
     else:
         if native.stdout:
             raise ValueError('Native parse oracle emitted an invalid state')
         expected['permutation_fingerprint'] = 0
         expected['orientation_fingerprint'] = 0
+        expected['p'], expected['q'] = 0, 0
     command = [ripes, '--mode', 'cli', '--src', elf, '-t', 'elf',
                '--proc', processor, '--timeout', '5000', '--json',
                '--iret', '--regs', '--runinfo']
@@ -80,6 +100,8 @@ def check(ripes, elf, processor):
         raise ValueError('RV32I parsed bytes differ from the native C parser')
     if registers['x2'] != stack_top:
         raise ValueError('RV32I parser did not preserve the stack pointer')
+    if registers['x19'] != expected['p'] or registers['x20'] != expected['q']:
+        raise ValueError('RV32I P/Q ranks differ from the native C rank oracle')
     marker = 'RV32I input valid\n' if native.returncode == 0 else 'RV32I input invalid\n'
     if marker not in result.stdout:
         raise ValueError('RV32I guest did not print the expected input marker')
@@ -94,7 +116,7 @@ def check(ripes, elf, processor):
         json.dumps(evidence, indent=2) + '\n')
     print(f'RV32I smoke passed: {processor}, '
           f'{report["# instructions retired"]} instructions retired, '
-          f'input status={native.returncode}, parsed fingerprints match')
+          f'input status={native.returncode}, parsed bytes and P/Q ranks match')
     return evidence
 
 

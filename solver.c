@@ -476,6 +476,36 @@ static void emit_query_tables(void)
     emit_byte_table("cube_mixed_distance", query_tables.mixed_distance, MIXED_BYTES);
 }
 
+/* Ranking-only fixtures: all P at Q=0, then all remaining Q at P=0.
+ * Each aligned record has fourteen state bytes followed by P and Q halfwords.
+ */
+static int emit_rank_cases(void)
+{
+    const uint32_t count = PERMUTATIONS + ORIENTATIONS - 1;
+    fputs(".section .rodata.rank_cases, \"a\", @progbits\n.balign 2\n"
+          ".globl cube_rank_cases\n.type cube_rank_cases, @object\n"
+          "cube_rank_cases:\n", stdout);
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t rank = i < PERMUTATIONS ? i * ORIENTATIONS : i - PERMUTATIONS + 1;
+        state_t state;
+        unrank_state(rank, &state);
+        if (!valid(&state) || rank_state(&state) != rank)
+            return 0;
+        fputs("    .byte ", stdout);
+        for (uint8_t j = 0; j < 14; ++j)
+            printf("%u%s", (unsigned) (j < CUBIES ? state.p[j] : state.o[j - CUBIES]),
+                    j == 13 ? "\n" : ",");
+        printf("    .2byte %lu,%lu\n", (unsigned long) (rank / ORIENTATIONS),
+                (unsigned long) (rank % ORIENTATIONS));
+    }
+    fputs(".size cube_rank_cases, .-cube_rank_cases\n.balign 4\n"
+          ".globl cube_rank_case_count\n.type cube_rank_case_count, @object\n"
+          "cube_rank_case_count:\n", stdout);
+    printf("    .4byte %lu\n", (unsigned long) count);
+    fputs(".size cube_rank_case_count, .-cube_rank_case_count\n", stdout);
+    return 1;
+}
+
 static uint8_t query_heuristic(uint16_t p, uint16_t q)
 {
     uint8_t basic =
@@ -1018,12 +1048,26 @@ int main(int argc, char **argv)
 {
     state_t state;
     uint8_t diameter;
-    /* Binary parse oracle for the assembly input checkpoint: p[7], o[7]. */
-    if (argc == 3 && !strcmp(argv[1], "--parse-state")) {
+    /* Host parse/rank oracles for the assembly input checkpoint. */
+    if (argc == 3 && (!strcmp(argv[1], "--parse-state") ||
+                     !strcmp(argv[1], "--rank-state"))) {
         if (!parse_state(argv[2], &state))
             return 2;
-        fwrite(state.p, 1, CUBIES, stdout);
-        fwrite(state.o, 1, CUBIES, stdout);
+        if (!strcmp(argv[1], "--rank-state")) {
+            uint32_t rank = rank_state(&state);
+            printf("%lu %lu\n", (unsigned long) (rank / ORIENTATIONS),
+                    (unsigned long) (rank % ORIENTATIONS));
+        } else {
+            fwrite(state.p, 1, CUBIES, stdout);
+            fwrite(state.o, 1, CUBIES, stdout);
+        }
+        return output_failed();
+    }
+    if (argc == 2 && !strcmp(argv[1], "--emit-rank-cases")) {
+        if (!emit_rank_cases()) {
+            fputs("rank fixture generation failed\n", stderr);
+            return 1;
+        }
         return output_failed();
     }
     if (argc == 2 && !strcmp(argv[1], "--emit-tables")) {
