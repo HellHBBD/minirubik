@@ -54,14 +54,20 @@ $(RV_BUILD)/rank.o: riscv/rank.S | $(RV_BUILD)
 $(RV_BUILD)/heuristic.o: riscv/heuristic.S | $(RV_BUILD)
 	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
 
+$(RV_BUILD)/move.o: riscv/move.S | $(RV_BUILD)
+	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+
+$(RV_BUILD)/search.o: riscv/search.S | $(RV_BUILD)
+	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
+
 force-rv-input:
 
 $(RV_BUILD)/input.o: $(RV_INPUT) force-rv-input | $(RV_BUILD)
 	$(RV_CC) $(RV_ASFLAGS) -c "$<" -o "$@"
 
-$(RV_BUILD)/smoke.debug.elf: $(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/heuristic.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o riscv/link.ld
+$(RV_BUILD)/smoke.debug.elf: $(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/heuristic.o $(RV_BUILD)/move.o $(RV_BUILD)/search.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o riscv/link.ld
 	$(RV_LD) -m elf32lriscv --no-relax -T riscv/link.ld -o "$@" \
-		$(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/heuristic.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o
+		$(RV_BUILD)/entry.o $(RV_BUILD)/parse.o $(RV_BUILD)/rank.o $(RV_BUILD)/heuristic.o $(RV_BUILD)/move.o $(RV_BUILD)/search.o $(RV_BUILD)/tables.o $(RV_BUILD)/input.o
 
 $(RV_BUILD)/smoke.elf: $(RV_BUILD)/smoke.debug.elf
 	$(RV_OBJCOPY) --strip-all --remove-section=.riscv.attributes "$<" "$@"

@@ -53,6 +53,22 @@ def fingerprint(values, bits):
         result = (result << bits) | value
     return result
 
+MOVE_NAMES = ('R', 'R2', "R'", 'B', 'B2', "B'", 'D', 'D2', "D'")
+SOURCES = ((1, 4, 2, 0, 3, 5, 6), (0, 1, 2, 4, 5, 6, 3), (0, 2, 5, 3, 1, 4, 6))
+TWISTS = ((1, 2, 0, 2, 1, 0, 0), (0, 0, 0, 1, 2, 1, 2), (0,) * 7)
+
+
+def replay(state, path):
+    p, o = list(state[:7]), list(state[7:])
+    for move in path:
+        if not 0 <= move < 9:
+            return False
+        face, turn = divmod(move, 3)
+        for _ in range(turn + 1):
+            p = [p[i] for i in SOURCES[face]]
+            o = [(o[i] + t) % 3 for i, t in zip(SOURCES[face], TWISTS[face])]
+    return p == list(range(7)) and o == [0] * 7
+
 
 def check(ripes, elf, processor):
     input_bytes, stack_top = external_input(elf)
@@ -79,6 +95,10 @@ def check(ripes, elf, processor):
         if h.returncode != 0:
             raise ValueError('Native heuristic oracle failed')
         expected['h'] = int(h.stdout)
+        solved = subprocess.run([b'./solver', input_bytes], capture_output=True, timeout=15)
+        if solved.returncode != 0:
+            raise ValueError('Native solution oracle failed')
+        expected['length'] = len(solved.stdout.split())
     else:
         if native.stdout:
             raise ValueError('Native parse oracle emitted an invalid state')
@@ -86,12 +106,13 @@ def check(ripes, elf, processor):
         expected['orientation_fingerprint'] = 0
         expected['p'], expected['q'] = 0, 0
         expected['h'] = 0
+        expected['length'] = -1
     command = [ripes, '--mode', 'cli', '--src', elf, '-t', 'elf',
-               '--proc', processor, '--timeout', '5000', '--json',
+               '--proc', processor, '--timeout', '30000', '--json',
                '--iret', '--regs', '--runinfo']
     result = subprocess.run(command, capture_output=True, text=True,
                             env={**os.environ, 'QT_QPA_PLATFORM': 'offscreen'},
-                            timeout=15)
+                            timeout=45)
     if result.returncode != 0 or 'ERROR:' in result.stdout + result.stderr:
         raise ValueError('Ripes failed: ' + result.stdout + result.stderr)
     start = result.stdout.find('{')
@@ -110,6 +131,19 @@ def check(ripes, elf, processor):
         raise ValueError('RV32I P/Q ranks differ from the native C rank oracle')
     if registers['x21'] != expected['h']:
         raise ValueError('RV32I heuristic differs from the native C oracle')
+    length = registers['x22']
+    if length == 0xFFFFFFFF:
+        length = -1
+    if length != expected['length']:
+        raise ValueError('RV32I solution length differs from the exact native solver')
+    path = []
+    if native.returncode == 0:
+        if not 0 <= length <= 11:
+            raise ValueError('Invalid solution length')
+        path = [(registers['x23'] >> (4 * i)) & 15 for i in range(min(length, 8))]
+        path += [(registers['x24'] >> (4 * i)) & 15 for i in range(max(length - 8, 0))]
+        if not replay(native.stdout, path):
+            raise ValueError('RV32I solution did not replay to solved')
     marker = 'RV32I input valid\n' if native.returncode == 0 else 'RV32I input invalid\n'
     if marker not in result.stdout:
         raise ValueError('RV32I guest did not print the expected input marker')
@@ -119,7 +153,7 @@ def check(ripes, elf, processor):
         raise ValueError('Ripes processor differs from the requested model')
     if report['runinfo']['ISA extensions'] != []:
         raise ValueError('Smoke test requires base RV32I without extensions')
-    evidence = {'command': command, 'expected': expected, 'report': report}
+    evidence = {'command': command, 'expected': expected, 'path': path, 'report': report}
     Path(elf).with_suffix('.report.json').write_text(
         json.dumps(evidence, indent=2) + '\n')
     print(f'RV32I smoke passed: {processor}, '

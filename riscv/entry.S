@@ -1,4 +1,4 @@
-/* A4: table-transfer, parsing, ranking and heuristic checkpoint.
+/* A5: search checkpoint; s6=length, s7/s8=path nibbles for host replay.
  * Ripes services: a7=4 prints the string at a0; a7=10 terminates.
  * s0 records status (0=valid, 1=checkpoint failure, 2=invalid input).
  * s1/s2 expose parsed bytes as fixed-width base-8/base-4 fingerprints;
@@ -18,6 +18,9 @@ _start:
     li s3, 0
     li s4, 0
     li s5, 0
+    li s6, -1
+    li s7, 0
+    li s8, 0
     la t0, cube_permutation_turn
     la t1, cube_orientation_turn
 
@@ -94,6 +97,37 @@ _start:
     mv a1, s4
     jal ra, cube_heuristic
     mv s5, a0
+    mv a0, s3
+    mv a1, s4
+    la a2, cube_path
+    jal ra, cube_solve
+    mv s6, a0
+    blt a0, zero, .Lfail
+    li t0, 11
+    bltu t0, a0, .Lfail
+    li t0, 0
+    la t1, cube_path
+.Lpath:
+    bgeu t0, s6, .Lpath_done
+    lbu t2, 0(t1)
+    li t3, 9
+    bgeu t2, t3, .Lfail
+    li t3, 8
+    bgeu t0, t3, .Lpath_high
+    slli t3, t0, 2
+    sll t2, t2, t3
+    or s7, s7, t2
+    j .Lpath_next
+.Lpath_high:
+    addi t3, t0, -8
+    slli t3, t3, 2
+    sll t2, t2, t3
+    or s8, s8, t2
+.Lpath_next:
+    addi t0, t0, 1
+    addi t1, t1, 1
+    j .Lpath
+.Lpath_done:
     la a0, .Lpass_message
     j .Lreport
 .Linvalid_input:
@@ -125,6 +159,13 @@ _start:
 cube_state:
     .space 14
 .size cube_state, .-cube_state
+
+.section .bss.path, "aw", @nobits
+.globl cube_path
+.type cube_path, @object
+cube_path:
+    .space 11
+.size cube_path, .-cube_path
 
 .section .bss.stack, "aw", @nobits
 .balign 16
