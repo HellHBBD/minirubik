@@ -10,7 +10,9 @@ enum {
     STATES = PERMUTATIONS * ORIENTATIONS,
     MOVES = 9,
     MAX_DEPTH = 11,
-    HARDEST_STATES = 2644
+    HARDEST_STATES = 2644,
+    SUBSETS = 35,
+    MIXED_STATES = SUBSETS * ORIENTATIONS
 };
 
 typedef struct {
@@ -265,18 +267,122 @@ typedef struct {
     uint16_t orientation[3][ORIENTATIONS];
     uint8_t permutation_distance[PERMUTATIONS];
     uint8_t orientation_distance[ORIENTATIONS];
+    uint8_t permutation_subset[PERMUTATIONS];
+    uint8_t subset_turn[3][SUBSETS];
+    uint8_t mixed_distance[MIXED_STATES];
 } coordinate_tables_t;
 
 static coordinate_tables_t query_tables;
 
-static int build_query_tables(void)
+static int build_basic_tables(void)
 {
     uint16_t queue[PERMUTATIONS];
     build_transitions(query_tables.permutation, query_tables.orientation);
     return build_coordinate_distances(PERMUTATIONS, query_tables.permutation,
-                                      query_tables.permutation_distance, queue) &&
+                                      query_tables.permutation_distance,
+                                      queue) &&
            build_coordinate_distances(ORIENTATIONS, query_tables.orientation,
                                       query_tables.orientation_distance, queue);
+}
+
+/* Track cubies 0, 1 and 2, ignoring their order within the occupied subset.
+ * The mask is indexed by position, just like state.p and state.o.
+ */
+static uint8_t occupied_mask(const state_t *state)
+{
+    uint8_t mask = 0;
+    for (uint8_t i = 0; i < CUBIES; ++i)
+        if (state->p[i] < 3)
+            mask = (uint8_t) (mask | (1U << i));
+    return mask;
+}
+
+static int build_subset_tables(void)
+{
+    uint8_t masks[SUBSETS], mask_index[1 << CUBIES];
+    uint8_t count = 0;
+    memset(mask_index, UINT8_MAX, sizeof mask_index);
+    /* Assign subset indices in ascending mask order. The abstract goal
+     * is obtained from the solved permutation, not assumed to be index 0.
+     */
+    for (uint16_t mask = 0; mask < (1U << CUBIES); ++mask) {
+        uint8_t bits = 0;
+        for (uint8_t i = 0; i < CUBIES; ++i)
+            bits = (uint8_t) (bits + ((mask >> i) & 1U));
+        if (bits == 3) {
+            if (count == SUBSETS)
+                return 0;
+            masks[count] = (uint8_t) mask;
+            mask_index[mask] = count++;
+        }
+    }
+    if (count != SUBSETS)
+        return 0;
+    for (uint16_t p = 0; p < PERMUTATIONS; ++p) {
+        state_t state;
+        unrank_state((uint32_t) p * ORIENTATIONS, &state);
+        query_tables.permutation_subset[p] = mask_index[occupied_mask(&state)];
+    }
+    for (uint8_t face = 0; face < 3; ++face) {
+        for (uint8_t subset = 0; subset < SUBSETS; ++subset) {
+            uint8_t next_mask = 0;
+            for (uint8_t i = 0; i < CUBIES; ++i)
+                if (masks[subset] & (1U << source[face][i]))
+                    next_mask = (uint8_t) (next_mask | (1U << i));
+            query_tables.subset_turn[face][subset] = mask_index[next_mask];
+        }
+    }
+    return 1;
+}
+
+static int build_mixed_distances(void)
+{
+    uint16_t queue[MIXED_STATES];
+    uint16_t head = 0, tail = 1;
+    uint8_t *distance = query_tables.mixed_distance;
+    uint16_t goal =
+        (uint16_t) (query_tables.permutation_subset[0] * ORIENTATIONS);
+    memset(distance, UINT8_MAX, MIXED_STATES);
+    distance[goal] = 0;
+    queue[0] = goal;
+    while (head < tail) {
+        uint16_t here = queue[head++];
+        uint8_t subset = (uint8_t) (here / ORIENTATIONS);
+        uint16_t q = (uint16_t) (here % ORIENTATIONS);
+        for (uint8_t face = 0; face < 3; ++face) {
+            uint8_t next_subset = subset;
+            uint16_t next_q = q;
+            for (uint8_t turn = 0; turn < 3; ++turn) {
+                next_subset = query_tables.subset_turn[face][next_subset];
+                next_q = query_tables.orientation[face][next_q];
+                uint16_t there =
+                    (uint16_t) (next_subset * ORIENTATIONS + next_q);
+                if (distance[there] == UINT8_MAX) {
+                    distance[there] = (uint8_t) (distance[here] + 1U);
+                    queue[tail++] = there;
+                }
+            }
+        }
+    }
+    return tail == MIXED_STATES;
+}
+
+static int build_query_tables(void)
+{
+    /* Separate calls keep the basic and mixed BFS scratch lifetimes apart. */
+    return build_basic_tables() && build_subset_tables() &&
+           build_mixed_distances();
+}
+
+static uint8_t query_heuristic(uint16_t p, uint16_t q)
+{
+    uint8_t basic =
+        coordinate_heuristic(p, q, query_tables.permutation_distance,
+                             query_tables.orientation_distance);
+    uint32_t index =
+        (uint32_t) query_tables.permutation_subset[p] * ORIENTATIONS + q;
+    uint8_t mixed = query_tables.mixed_distance[index];
+    return basic > mixed ? basic : mixed;
 }
 
 typedef struct {
@@ -300,9 +406,7 @@ static int solve_coordinate(uint16_t p,
                             search_stats_t *stats)
 {
     frame_t frames[MAX_DEPTH + 1];
-    uint8_t initial = coordinate_heuristic(p, q,
-                                         query_tables.permutation_distance,
-                                         query_tables.orientation_distance);
+    uint8_t initial = query_heuristic(p, q);
     for (uint8_t bound = initial; bound <= MAX_DEPTH; ++bound) {
         uint8_t depth = 0;
         /* Face 3 is the root sentinel: none of R/B/D is excluded. */
@@ -336,9 +440,7 @@ static int solve_coordinate(uint16_t p,
             }
             if (stats)
                 ++stats->generated[bound];
-            uint8_t h = coordinate_heuristic(next_p, next_q,
-                                           query_tables.permutation_distance,
-                                           query_tables.orientation_distance);
+            uint8_t h = query_heuristic(next_p, next_q);
             if (depth + 1U + h > bound) {
                 if (stats)
                     ++stats->cutoffs[bound];
@@ -500,6 +602,76 @@ static int self_test(void)
     return 1;
 }
 
+static int self_test_mixed(void)
+{
+    uint8_t masks[SUBSETS] = {0};
+    uint8_t maximum = 0;
+    /* Recover each label's mask from cubie states, independently of the
+     * builder's mask enumeration. A label must describe exactly one mask.
+     */
+    for (uint16_t p = 0; p < PERMUTATIONS; ++p) {
+        state_t state;
+        unrank_state((uint32_t) p * ORIENTATIONS, &state);
+        uint8_t subset = query_tables.permutation_subset[p];
+        uint8_t mask = occupied_mask(&state);
+        if (subset >= SUBSETS || (masks[subset] && masks[subset] != mask))
+            return 0;
+        masks[subset] = mask;
+    }
+    for (uint8_t subset = 0; subset < SUBSETS; ++subset)
+        if (!masks[subset])
+            return 0;
+    for (uint16_t p = 0; p < PERMUTATIONS; ++p) {
+        state_t state;
+        unrank_state((uint32_t) p * ORIENTATIONS, &state);
+        for (uint8_t face = 0; face < 3; ++face) {
+            state_t next = state;
+            uint16_t next_p = p;
+            uint8_t subset = query_tables.permutation_subset[p];
+            for (uint8_t turn = 0; turn < 3; ++turn) {
+                next = quarter_turn(next, face);
+                next_p = query_tables.permutation[face][next_p];
+                subset = query_tables.subset_turn[face][subset];
+                if (subset >= SUBSETS ||
+                    subset != query_tables.permutation_subset[next_p] ||
+                    masks[subset] != occupied_mask(&next))
+                    return 0;
+            }
+        }
+    }
+    uint16_t goal =
+        (uint16_t) (query_tables.permutation_subset[0] * ORIENTATIONS);
+    for (uint16_t index = 0; index < MIXED_STATES; ++index) {
+        uint8_t distance = query_tables.mixed_distance[index];
+        if (distance > MAX_DEPTH || ((distance == 0) != (index == goal)))
+            return 0;
+        int descends = index == goal;
+        for (uint8_t face = 0; face < 3; ++face) {
+            uint8_t subset = (uint8_t) (index / ORIENTATIONS);
+            uint16_t q = (uint16_t) (index % ORIENTATIONS);
+            for (uint8_t turn = 0; turn < 3; ++turn) {
+                subset = query_tables.subset_turn[face][subset];
+                q = query_tables.orientation[face][q];
+                uint16_t next = (uint16_t) (subset * ORIENTATIONS + q);
+                uint8_t neighbor = query_tables.mixed_distance[next];
+                if (distance > neighbor + 1U)
+                    return 0;
+                if (distance == neighbor + 1U)
+                    descends = 1;
+            }
+        }
+        if (!descends)
+            return 0;
+        if (distance > maximum)
+            maximum = distance;
+    }
+    fprintf(stderr,
+            "mixed PDB: cubies {0,1,2}; 25515 entries; maximum %u; "
+            "projection and abstract distances checked\n",
+            (unsigned) maximum);
+    return 1;
+}
+
 /* Only the host self-test uses the exhaustive oracle. Walk its stored moves
  * with the cubie model to obtain an exact distance independently of the new
  * abstract BFS. This also checks that each oracle path actually solves.
@@ -507,6 +679,7 @@ static int self_test(void)
 static int self_test_heuristic(const uint8_t *toward_solved)
 {
     uint32_t gaps[12] = {0};
+    uint32_t strengthened = 0;
     uint8_t maximum = 0;
     if (query_tables.permutation_distance[0] != 0 ||
         query_tables.orientation_distance[0] != 0)
@@ -514,9 +687,10 @@ static int self_test_heuristic(const uint8_t *toward_solved)
     for (uint32_t rank = 0; rank < STATES; ++rank) {
         uint16_t p = (uint16_t) (rank / ORIENTATIONS);
         uint16_t q = (uint16_t) (rank % ORIENTATIONS);
-        uint8_t h = coordinate_heuristic(p, q,
-                                        query_tables.permutation_distance,
-                                        query_tables.orientation_distance);
+        uint8_t basic =
+            coordinate_heuristic(p, q, query_tables.permutation_distance,
+                                 query_tables.orientation_distance);
+        uint8_t h = query_heuristic(p, q);
         uint8_t distance = 0;
         uint32_t here = rank;
         state_t state;
@@ -529,8 +703,10 @@ static int self_test_heuristic(const uint8_t *toward_solved)
             here = rank_state(&state);
             ++distance;
         }
-        if (h > distance)
+        if (h > distance || h < basic)
             return 0;
+        if (h > basic)
+            ++strengthened;
         ++gaps[distance - h];
         if (h > maximum)
             maximum = h;
@@ -538,8 +714,10 @@ static int self_test_heuristic(const uint8_t *toward_solved)
     /* Keep the existing stdout contract; these diagnostics are self-test
      * statistics, not extra query output. All counts cover the full domain.
      */
-    fprintf(stderr, "P/Q heuristic: 3674160 states checked; maximum %u\n",
-            (unsigned) maximum);
+    fprintf(stderr,
+            "P/Q + mixed heuristic: 3674160 states checked; maximum %u; "
+            "%lu states strengthened\n",
+            (unsigned) maximum, (unsigned long) strengthened);
     for (uint8_t gap = 0; gap < 12; ++gap)
         fprintf(stderr, "distance - heuristic = %u: %lu states\n",
                 (unsigned) gap, (unsigned long) gaps[gap]);
@@ -564,14 +742,13 @@ static int oracle_distance(state_t state, const uint8_t *toward_solved)
     return distance;
 }
 
-static int check_search(state_t state,
-                        int expected,
-                        search_stats_t *stats)
+static int check_search(state_t state, int expected, search_stats_t *stats)
 {
     uint8_t path[MAX_DEPTH];
     uint32_t rank = rank_state(&state);
-    int length = solve_coordinate((uint16_t) (rank / ORIENTATIONS),
-                                  (uint16_t) (rank % ORIENTATIONS), path, stats);
+    int length =
+        solve_coordinate((uint16_t) (rank / ORIENTATIONS),
+                         (uint16_t) (rank % ORIENTATIONS), path, stats);
     if (length != expected || !replay_solution(state, path, length)) {
         fprintf(stderr, "search failed at rank %lu: expected %d, got %d\n",
                 (unsigned long) rank, expected, length);
@@ -605,10 +782,8 @@ static int self_test_search(const uint8_t *toward_solved,
                             uint16_t count)
 {
     static const char *const vectors[] = {
-        "12345671111111", "62345713133111", "24316572122213",
-        "25713642221111", "24513763133333", "43752611332133",
-        "25416373331111", "21345671111111"
-    };
+        "12345671111111", "62345713133111", "24316572122213", "25713642221111",
+        "24513763133333", "43752611332133", "25416373331111", "21345671111111"};
     uint32_t vector_ranks[sizeof vectors / sizeof vectors[0]];
     uint32_t checked = 0, hardest_seen = 0;
     search_stats_t stats = {0};
@@ -647,17 +822,18 @@ static int self_test_search(const uint8_t *toward_solved,
     fprintf(stderr, "IDA* replay and exact length: %lu states checked",
             (unsigned long) checked);
     if (hardest)
-        fprintf(stderr, "; hardest indices [%u,%u)",
-                (unsigned) first, (unsigned) (first + count));
+        fprintf(stderr, "; hardest indices [%u,%u)", (unsigned) first,
+                (unsigned) (first + count));
     fputc('\n', stderr);
     print_search_stats(&stats);
     fprintf(stderr,
             "query tables %lu bytes; frames %lu bytes; path %u bytes; "
-            "build queue %lu bytes\n",
+            "basic build queue %lu bytes; mixed build queue %lu bytes\n",
             (unsigned long) sizeof query_tables,
             (unsigned long) ((MAX_DEPTH + 1) * sizeof(frame_t)),
             (unsigned) MAX_DEPTH,
-            (unsigned long) (PERMUTATIONS * sizeof(uint16_t)));
+            (unsigned long) (PERMUTATIONS * sizeof(uint16_t)),
+            (unsigned long) (MIXED_STATES * sizeof(uint16_t)));
     return 1;
 }
 
@@ -696,8 +872,8 @@ int main(int argc, char **argv)
             fputs("BFS check failed\n", stderr);
             return 1;
         }
-        if (!build_query_tables() || !self_test_heuristic(table) ||
-            !self_test_search(table, 0, 0, 0)) {
+        if (!build_query_tables() || !self_test_mixed() ||
+            !self_test_heuristic(table) || !self_test_search(table, 0, 0, 0)) {
             free(table);
             fputs("coordinate solver check failed\n", stderr);
             return 1;
