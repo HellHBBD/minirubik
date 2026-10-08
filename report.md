@@ -1,5 +1,37 @@
 # Optimizations and RISC-V Assembly
 
+This work starts from upstream [`sysprog21/minirubik`](https://github.com/sysprog21/minirubik) commit [`3811ad0a87bd490e45099c3cb179ec33caf46cb5`](https://github.com/sysprog21/minirubik/commit/3811ad0a87bd490e45099c3cb179ec33caf46cb5). The original BFS write-up is retained as [`baseline-report.md`](https://github.com/HellHBBD/minirubik/blob/main/baseline-report.md); the implementation is in the [GitHub fork](https://github.com/HellHBBD/minirubik).
+
+The four stages are baseline characterization, target-sized representation and search, C optimization, and handwritten RV32I implementation. Measurements use Ripes at commit `0b4c65b`.
+
+## AI Use Disclosure
+
+### Tools and Scope
+
+I used OpenCode, an AI coding assistant, and other AI tools, including ChatGPT, to support the preparation and review of this assignment. The assistance included:
+
+- **Information and Literature Research:** Searching for relevant online resources, academic literature, and technical documentation to better understand the problem and related concepts.
+- **Translation and Language Editing:** Translating relevant materials and improving the grammar, clarity, readability, and academic tone of the report.
+- **Problem-Solving Discussions:** Discussing possible approaches, evaluating alternative solutions, and clarifying technical concepts to support my understanding of the assignment.
+- **Report Review:** Reviewing the report against the assignment requirements, identifying possible omissions or unclear explanations, and suggesting improvements to its structure and presentation.
+- **AI Disclosure:** Assisting in drafting and refining this AI use disclosure.
+
+### Technical Work Affected
+
+AI assistance was primarily used to support research, conceptual understanding, problem-solving discussions, and technical communication.
+
+During the development process, I consulted AI tools to explore possible solution strategies, discuss their advantages and limitations, and better understand relevant theoretical and technical concepts. These discussions helped me evaluate different approaches and refine my reasoning.
+
+AI tools also assisted in reviewing technical explanations, checking whether the report adequately addressed the assignment requirements, and improving the clarity of the written analysis.
+
+The assistance was mainly advisory and editorial. I reviewed and evaluated AI-generated suggestions before incorporating them into my work. The final selection of methods, technical decisions, implementation, and conclusions remained my responsibility.
+
+### Responsibility and Verification
+
+I reviewed AI-assisted content for accuracy, relevance, and consistency with the assignment requirements. I also take responsibility for verifying technical explanations and ensuring that the submitted report accurately reflects the work performed.
+
+I am responsible for the submitted work, the accuracy of its claims, and explaining the implementation and development decisions during the interview.
+
 # 1. State Space, Group, and HTM Diameter
 
 ## 1.1 Group and State Space
@@ -382,7 +414,7 @@ Therefore,
 $$
 \begin{aligned}
 \operatorname{rank}_{\max}
-&=729\cdot5039+728$
+&=729\cdot5039+728\\
 &=3,674,159.
 \end{aligned}
 $$
@@ -467,6 +499,80 @@ This excludes any additional query state, constants, or other runtime storage.
 > Both cases exceed the target memory limit of **128 KiB**.
 >
 > The problem is not merely that the queue is too large: retaining a complete state table is itself unsuitable for the target.
+
+## 2.3 Measured Sparse-memory Cost
+
+Guest bytes do not map one-for-one to host bytes. Ripes' VSRTL memory model uses a byte-keyed `unordered_map`: a word store creates four byte entries, together with hash-table and allocation overhead.
+
+An independent [RV32I calibration kernel](https://github.com/HellHBBD/minirubik/blob/main/riscv/calibration.S) writes `0x12345678` to every aligned word in a region starting at `0x100000`, outside its program image and stack. The loop is unchanged between region sizes:
+
+```asm
+sw   s8, 0(t0)
+addi t0, t0, 4
+addi t1, t1, -1
+bnez t1, .Lword
+```
+
+The kernel checks completion and the first and last words. The measured region is written at runtime, while the loop and program layout remain the same across sizes.
+
+For memory measurements, each region is written once, with three fresh Ripes processes per size. Linux `wait4` supplies peak process RSS in KiB, converted to bytes; compiler and Python-driver memory are excluded. The table reports the median of the three observations.
+
+| Guest region bytes | Median host peak RSS bytes |
+| -----------------: | -------------------------: |
+|    65,536, control |                 65,368,064 |
+|          1,048,576 |                107,884,544 |
+|          2,097,152 |                153,628,672 |
+|          4,194,304 |                244,301,824 |
+
+Subtracting the small control removes the fixed process cost. The endpoint slope is:
+
+$$
+r=\frac{244,301,824-65,368,064}{4,194,304-65,536}
+=\boxed{43.3383\text{ host bytes per guest byte}}.
+$$
+
+The other control-relative slopes are 43.2500 and 43.4435, supporting an approximately linear projection over the measured range. Applying the measured endpoint slope to the baseline peak gives:
+
+$$
+\text{incremental host bytes}=r\times18,405,414
+\approx797,659,237\text{ B},
+$$
+
+and, including the fixed cost inferred from the control:
+
+$$
+\text{projected peak RSS}=65,368,064+r(18,405,414-65,536)
+\approx860,187,082\text{ B}=\boxed{820.3\text{ MiB}}.
+$$
+
+This is an empirical extrapolation on the measured installation, not a run of the full BFS baseline on Ripes. Hash-table growth need not remain exactly linear beyond the measured regions.
+
+## 2.4 Measured Simulation Rate
+
+The same kernel writes a 64 KiB region for 128 passes, reusing the sparse-memory entries. Three fresh-process observations are made for each processor. Rate is `--iret / --exectime`, using Ripes' millisecond model execution time and excluding compilation, startup, and teardown.
+
+| Model      | Retired instructions | Model times, ms        | Median instructions/s | Projected time for $10^9$ instructions |
+| ---------- | -------------------: | ---------------------- | --------------------: | -------------------------------------: |
+| `RV32_ISS` |            8,389,271 | 403, 433, 407          |            20,612,459 |                                48.51 s |
+| `RV32_5S`  |            8,389,270 | 33,380, 33,932, 33,340 |               251,326 |               3,978.89 s, or 66.31 min |
+
+The loop's operation count is `bytes * passes + 5 * passes + 23` on this ISS build. The five-stage model retires one fewer instruction because ISS also retires the post-exit halt instruction.
+
+The baseline expands 33,067,440 edges, advancing two coordinates per edge: 66,134,880 transition updates. At an estimated fifteen instructions per update, this is on the order of $10^9$ instructions. Dividing that estimate by the measured rates gives the times above. Neither the baseline instruction count nor its projected execution time is a measured target BFS result. The memory loop also does not reproduce the full BFS branch/load mix.
+
+Both experiments use the same Ripes installation. These measured rates characterize this memory-loop workload, not every instruction mix.
+
+## 2.5 Why the Baseline's Section 7 Advice Changes
+
+The [baseline report's Section 7](https://github.com/HellHBBD/minirubik/blob/main/baseline-report.md#7-implementation-notes-and-possible-improvements) argues for keeping the full table because it is the verification artifact. That is useful on a hosted machine: exhaustive enumeration establishes connectivity and diameter. It does not require the target to retain the same representation.
+
+Three measured or quantified constraints change the decision:
+
+1. The 18,405,414-byte baseline peak is about 140 times the 128 KiB target budget. The measured sparse-memory slope projects roughly 820.3 MiB of host peak RSS, rather than 17.55 MiB.
+2. Removing the queue still leaves a 3,674,160-byte move table. A four-bit full-state table would also exceed the budget and is excluded by the assignment's precomputation rule. Generating it on the host removes simulated construction work, but not the target storage problem.
+3. Building it on the target instead entails approximately $10^9$ instructions: about 48.51 seconds on the measured ISS rate and 66.31 minutes on the measured five-stage rate, even before considering a different BFS memory-access mix. A native baseline's short build time cannot be transferred to a visual pipeline simulator.
+
+The exact BFS oracle therefore stays on the host. The target receives compact transition and abstraction tables, then performs optimal search itself. Stage 2 selects that representation; Stage 3 reduces the C search work and storage before translation.
 
 # 3. Stage 2 — Compact Representation and Search
 
@@ -846,7 +952,59 @@ The six tables therefore require a total payload of **58,181 bytes**.
 
 This 58,181-byte query-table payload is the persistent table cost used by the target solver. The complete linked memory footprint is evaluated later after the full RV32I solver has been integrated.
 
-# 4. Stage 3 — Handwritten RV32I Implementation
+# 4. Stage 3 — C Optimization
+
+Stage 2 establishes the algorithm and its optimality. This stage explains how the C implementation reduces work within that algorithm, using operation counts and storage sizes rather than target timing claims. The original C milestones precede the assembly checkpoints.
+
+## 4.1 Keep Ranking and Cubie Traffic Out of the Search Loop
+
+The baseline already factors transitions during BFS. [`027f066`](https://github.com/HellHBBD/minirubik/commit/027f0667f2ff664a3502365ec4f70c9379b97d3a) extracts that construction for reuse, and [`25c6d23`](https://github.com/HellHBBD/minirubik/commit/25c6d2328696593e818e8d08c9b45841121910bd) uses P/Q coordinates in query-time IDA*. This avoids introducing fourteen-byte cubie copies and child ranking into the new search. For each quarter turn it performs two halfword transition-table reads, one for P and one for Q. A candidate requires one, two, or three quarter-turn updates, so two, four, or six transition reads produce its child coordinates.
+
+Cubie-level ranking would perform 21 pairwise permutation comparisons plus six orientation recurrence steps for each ranked state, in addition to moving the cubie bytes. This is an operation-count comparison with a cubie-based search, not a claim that the original factored BFS ranked every edge. Ranking remains at query entry, and cubie replay remains in the host correctness check.
+
+This is a trade-off: 34,614 B of quarter-turn transition data replaces repeated cubie transforms and ranking. Storing all nine HTM transitions would require 103,842 B, so half and inverse turns deliberately pay extra lookups to keep three rows per coordinate.
+
+## 4.2 Skip Work and Delay Writes
+
+Same-face pruning checks the candidate face before any transition or heuristic lookup. At non-root frames it excludes three of the nine moves, leaving six potentially useful candidates. This adds a branch, but avoids computing children that cannot be needed in a shortest path; it is not a claim that every branch should be removed.
+
+The parent cursor advances before descent. A cutoff is checked before writing the path or child frame:
+
+```c
+if (depth + 1U + h > bound)
+    continue;
+path[depth] = move;
+++depth;
+frames[depth] = (frame_t) {next_p, next_q, face, 0};
+```
+
+A rejected candidate therefore avoids the path-byte write and child-frame initialization. Each frame contains two `uint16_t` coordinates and two byte fields, for six bytes; twelve frames require 72 B. This fixed storage implements DFS without recursive call frames while preserving the parent state for backtracking. It does not eliminate the necessary cursor update or all search memory traffic.
+
+Keeping P and Q separate avoids splitting `729P + Q` through division/remainder at each search frame or recomputing a composite rank for every child. Constants such as the mixed index's `729 * subset + Q` still require arithmetic; the C formulation does not by itself prove that the handwritten target implements it efficiently.
+
+## 4.3 Stronger Heuristic, Measured Search-work Reduction
+
+[`9a016b3`](https://github.com/HellHBBD/minirubik/commit/9a016b3374ee0e3b7c2a71a0e6373205faa61b2d) adds the mixed subset/orientation PDB without changing the frame traversal, move order, or same-face pruning. Each heuristic lookup adds a P-to-subset projection and a mixed-distance lookup. That extra memory traffic gives a stronger cutoff bound for 2,382,076 states in the full-domain comparison.
+
+The C3, C4, and C5 sources were rebuilt from their historical commits with `cc -O3 -std=c99`. Each version searches the same 2,644 distance-11 states, checks exact length and cubie replay, and sums generated candidates over every IDA* bound:
+
+| Version                    | Commit    | Generated candidates, all 2,644 cases |
+| -------------------------- | --------- | ------------------------------------: |
+| C3, independent P/Q bounds | `25c6d23` |                           546,298,522 |
+| C4, mixed PDB added        | `9a016b3` |                           126,715,030 |
+| C5, mixed PDB packed       | `473e2e5` |                           126,715,030 |
+
+The mixed heuristic reduces generated candidates by approximately **76.8%**, at the cost of additional PDB storage and lookup work per candidate. These are native search-work counters, not retired instructions or a measured target speedup.
+
+## 4.4 Packing: Less Storage, Not Fewer Search Operations
+
+[`473e2e5`](https://github.com/HellHBBD/minirubik/commit/473e2e5c0c6bdee03116e6c95447c48502cc56c7) stores two mixed distances per byte. The payload falls from 25,515 B to 12,758 B, saving 12,757 B. The C query-table struct falls from 71,044 B to 58,286 B; its 12,758 B reduction also includes a byte of layout/padding difference.
+
+The accessor uses `index >> 1`, an even/odd nibble shift, and a mask. Thus, packing saves storage but adds extraction operations compared with a direct byte lookup. C4 and C5 have identical aggregate expanded/generated/cutoff/same-face counters on the reproduced corpus. Packed/unpacked equality is independently checked by H4.
+
+The later GCC-reference configuration in [`661ced5`](https://github.com/HellHBBD/minirubik/commit/661ced59a00947ee694e5fdcec8fc6eb3b78bfbc) additionally lowers bounded ranking factors to shifts/adds, decodes moves through comparisons instead of `/3` and `%3`, and avoids parser `%7`. That target-mode work was added after the first handwritten assembly; it is documented in Section 7.5 as compiler-reference preparation, not retroactively presented as an earlier C milestone.
+
+# 5. Stage 4 — Handwritten RV32I Implementation
 
 This section focuses on how the C data and control flow are implemented in RV32I: which registers carry arguments, how data is addressed, and how search state is preserved across function calls.
 
@@ -863,7 +1021,7 @@ This section focuses on how the C data and control flow are implemented in RV32I
 
 The parser, ranking, heuristic, and move routines are leaf functions: they do not call other functions and therefore require no additional stack frames.
 
-## 4.1 Input Parsing and Validation
+## 5.1 Input Parsing and Validation
 
 `cube_input` is a string embedded in the assembly image. The parser writes directly to `cube_state`: offsets `0..6` hold the permutation and offsets `7..13` hold the orientations, both converted to zero-based bytes.
 
@@ -891,7 +1049,7 @@ The parser does not call `strlen`: short strings are rejected when the range che
 
 The function clobbers only `a0` and `t0..t6`, preserving `sp`, `ra`, and the `s*` registers. On failure, the output buffer may be partially written, but `_start` checks the status before using it.
 
-## 4.2 P/Q Ranking
+## 5.2 P/Q Ranking
 
 `cube_rank_state` receives a validated state pointer. Register `t0` holds the buffer base, `t1` accumulates P, `t2` is the position index, and `t4` counts smaller elements. Across the seven positions, the function performs 21 comparisons with elements to the right.
 
@@ -915,7 +1073,7 @@ Therefore, one shift and one addition implement the multiplication in `Q = 3Q + 
 
 `_start` stores the root P/Q in its own `s3/s4` and checks `P < 5040` and `Q < 729`. Ranking is performed only once at query entry. Search children are generated directly from transition tables rather than ranked again.
 
-## 4.3 Heuristic Lookup
+## 5.3 Heuristic Lookup
 
 The heuristic uses three distance tables:
 
@@ -931,7 +1089,7 @@ Here:
 
 `cube_heuristic` receives `a0=P` and `a1=Q`. The `dP`, `dQ`, and subset tables contain byte entries, so each address is simply `base + index` and is read with `lbu`. Unlike transition-table entries, these indices do not need to be multiplied by two.
 
-`t1` holds the larger of dP and dQ, while `t3` receives the subset index. The mixed index is `729 * subset + Q`. This baseline computes it by repeatedly adding 729, skipping the loop when `subset = 0`. Because this calculation lies on the hot lookup path, it contributes to the performance difference discussed in Section 6.5.
+`t1` holds the larger of dP and dQ, while `t3` receives the subset index. The mixed index is `729 * subset + Q`. This baseline computes it by repeatedly adding 729, skipping the loop when `subset = 0`. Because this calculation lies on the hot lookup path, it contributes to the performance difference discussed in Section 7.5.
 
 The packed accessor first records the low bit of the index, then shifts the index right by one to obtain the byte offset. An even index requires a shift of 0; an odd index requires a shift of 4:
 
@@ -945,7 +1103,7 @@ andi t3, t3, 15
 
 This leaf function preserves `a1` but clobbers `a0` and temporary registers. Callers cannot leave a child P in `a0` and expect it to survive the call.
 
-## 4.4 Explicit-frame IDA*
+## 5.4 Explicit-frame IDA*
 
 `cube_solve` must preserve search state across calls to `cube_apply_move` and `cube_heuristic`, so it uses saved registers. The following assignments apply only inside the search routine:
 
@@ -986,7 +1144,7 @@ Because `a0` then holds h, the next child frame is written from `s6/s7`. The pat
 
 The root frame sets its previous-face byte to 3. The goal check tests whether `P | Q` is zero and runs before the depth-limit check. Both the ordering of these conditions and the position of the cursor update directly affect the assembly control flow.
 
-## 4.5 Replay and Output
+## 5.5 Replay and Output
 
 `cube_replay` receives the original P/Q, the path pointer, and the path length. In CLI mode, it uses a 16-byte stack frame to preserve the cursor, length, applied-move count, and `ra`. Each move is range-checked before `cube_apply_move` is called.
 
@@ -1006,57 +1164,49 @@ ecall
     j .Lhalt
 ```
 
-Invalid inputs return status 2, internal verification failures return 1, and successful queries return 0. The CLI print-string service also emits a NUL terminator and a simulator exit notice. The checker retains the raw output, verifies the exit status separately, and then compares the complete move line.
+Invalid inputs return status 2, internal verification failures return 1, and successful queries return 0. The CLI print-string service also emits a NUL terminator and a simulator exit notice.
 
-# 5. RV32I Correctness Validation
+# 6. RV32I Correctness Validation
 
-The host oracle from Section 3.4 is retained as a reference. This section additionally checks assembly argument passing, register and memory operations, and actual execution in Ripes:
+The exact BFS oracle supplies shortest distances. Comparing solution length with that oracle establishes optimality; replay separately checks that the moves actually solve the cube. Independent host replay uses cubie source/twist operations rather than the target's coordinate tables.
 
-| Gate | Validation                                                                                            |
-| ---- | ----------------------------------------------------------------------------------------------------- |
-| H1   | $h(s) \le d(s)$ over all 3,674,160 states                                                             |
-| H2   | Population, maximum values, solved entries, and transition bijections for all dependent tables        |
-| H3   | Search length equals the exact distance for every state, and the path replays to solved               |
-| H4   | Every packed mixed-table entry equals its unpacked reference                                          |
-| T5   | Target replay and independent host cubie replay of returned paths, including all 2,644 hardest states |
-| T6   | `21345671111111` returns an optimal 11-move solution                                                  |
-| T7   | Solved, one R move, and the specified distance-11 case reproduced on both ISS and RV32_5S             |
+| Gate | Verified scope and result                                                                                | Status |
+| ---- | -------------------------------------------------------------------------------------------------------- | ------ |
+| H1   | $h(s) \le d(s)$ for all 3,674,160 states                                                                 | PASS   |
+| H2   | Every dependent table fully populated; maximum values, solved entries, and transition bijections checked | PASS   |
+| H3   | Exact solution length and successful cubie replay for all 3,674,160 states; **147.519647 s**             | PASS   |
+| H4   | All 25,515 packed mixed entries equal the unpacked reference, including even and odd indices             | PASS   |
+| T5   | Target replay reaches solved; independently replayed returned paths include all 2,644 distance-11 cases  | PASS   |
+| T6   | `21345671111111` produces an optimal 11-move solution                                                    | PASS   |
+| T7   | Solved, one-R-move, and the specified distance-11 case reproduced on `RV32_ISS` and `RV32_5S`            | PASS   |
 
-H3 uses 57 contiguous rank ranges to cover `[0,3674160)` completely, without sampling or skipping states.
+H3 covers `[0,3674160)` in 57 contiguous ranges without sampling. Its wall-clock time is the sum of batch durations, including oracle/table preparation, search, replay, and output, but excluding idle time between batches. It is separate from the target collection time in Section 7.4. Full-domain search verification is on the host; the exhaustive target performance test covers the 2,644 hardest states.
 
-Separate target checks isolate potential implementation errors:
+For T7, both models run the renderer-off full entry, validate the returned path, and replay to solved:
 
-| Check                   | Coverage and purpose                                                                                                                                              |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Parser / complete entry | 122 cases: 27 valid and 95 invalid, covering short/long strings, duplicates, digit and high-byte boundaries at every position, orientation sums, and NUL handling |
-| Ranking kernel          | 5,768 records covering all 5,040 P values and 729 Q values; verifies `a0/a1` returns and complete traversal                                                       |
-| Heuristic kernel        | 30,555 calls, including all 25,515 mixed entries; verifies byte addressing and even/odd nibble selection                                                          |
-| Replay-only kernel      | 12 cases covering incorrect paths, invalid moves/lengths/coordinates, and saved-register canaries                                                                 |
-| Instruction audit       | Decodes 451 machine words in linked `.text` and confirms that all use uncompressed base RV32I instructions                                                        |
+| Input            | Solution length | `RV32_ISS` iret | `RV32_5S` iret | Result       |
+| ---------------- | --------------: | --------------: | -------------: | ------------ |
+| `12345671111111` |               0 |             938 |            937 | PASS on both |
+| `25314672313211` |               1 |           1,355 |          1,354 | PASS on both |
+| `21345671111111` |              11 |      21,411,801 |     21,411,800 | PASS on both |
 
-For each complete query, the checker verifies more than the simulator's host process exit code. It checks guest status, parsed-byte fingerprints, P/Q, h, path length, stack pointer, final P/Q, applied-move count, and complete output. Successful simulator process termination does not imply that the guest solved the cube correctly.
+The one-instruction difference comes from the pinned ISS's post-exit retirement, not a different search or an omitted move.
 
-Host replay updates the cubie model through its source/twist operations without reading the target's transition tables, reducing the risk of both implementations sharing the same error. The ranking and heuristic domain tests do not claim that the target searched all 3,674,160 combined states; full-domain optimality is established by H3.
+Additional target checks cover 122 parser/entry cases (27 valid, 95 invalid), 5,768 ranking records spanning all P/Q coordinates, 30,555 heuristic calls including all mixed entries, and 12 replay cases covering invalid paths and ABI preservation. The linked instruction audit confirms 451 uncompressed base-RV32I instructions. These checks supplement the gates above; they do not replace H3's full-domain optimality verification.
 
-Negative controls confirm that the checker rejects faults: it detects both a modified replay result that falsely reports success before reaching solved and a modified output token changing `R'` to `X'`. Section 7 also includes a renderer palette-corruption test.
+# 7. Memory and Performance Evaluation
 
-# 6. Memory and Performance Evaluation
+The following sizes are measured from the linked **final renderer-off ELF**:
 
-The following measurements use the **final renderer-off ELF**. Static data is checked against the actual linked section sizes:
+| Section                                       |      Bytes |
+| --------------------------------------------- | ---------: |
+| `.text`                                       |      1,804 |
+| `.rodata`                                     |     58,290 |
+| `.data`                                       |          0 |
+| `.bss`, including stack reserve               |      1,128 |
+| **Static data: `.rodata` + `.data` + `.bss`** | **59,418** |
 
-```bash
-llvm-readelf -h -S -s -A build-rv32i/smoke.debug.elf
-```
-
-The main sections are:
-
-```text
-.text    Address 00001000  Size 00070c
-.rodata  Address 00001710  Size 00e3b2
-.bss     Address 0000fad0  Size 000468
-```
-
-## 6.1 `.rodata`
+## 7.1 `.rodata`
 
 `.rodata` contains error messages, move tokens, six query tables, and the input.
 
@@ -1070,28 +1220,7 @@ The main sections are:
 | Packed mixed distances |     12,758 |
 | **Total**              | **58,181** |
 
-The first table and the input appear in the symbol table as:
-
-```text
-0000176e 30240 OBJECT cube_permutation_turn
-0000fab3    15 OBJECT cube_input
-```
-
-Their address difference is:
-
-$$
-0xfab3-0x176e=0xe345=58,181\text{ B},
-$$
-
-matching the sum of the six tables.
-
-The data preceding the tables extends from the start of `.rodata` at `0x1710` to `0x176e`:
-
-$$
-0x176e-0x1710=94\text{ B}.
-$$
-
-The two error messages occupy $20+34=54$ B. The nine move tokens, space, and newline occupy $36+2+2=40$ B. These sizes include the necessary `\0` terminators.
+The two error messages occupy $20+34=54$ B. The nine move tokens, space, and newline occupy $36+2+2=40$ B, giving 94 B of messages and output strings. These sizes include the necessary `\0` terminators.
 
 The input occupies 15 B: fourteen characters and a terminating `\0`. Therefore:
 
@@ -1099,19 +1228,19 @@ $$
 \text{.rodata}=94+58,181+15=\boxed{58,290\text{ B}}.
 $$
 
-## 6.2 `.bss`
+## 7.2 `.bss`
 
-The final layout is shown below. End addresses are exclusive:
+The `.bss` allocation is:
 
-| Item                    | Start → End       | Bytes |
-| ----------------------- | ----------------- | ----: |
-| `cube_state`            | `0xfad0 → 0xfade` |    14 |
-| `cube_path`             | `0xfade → 0xfae9` |    11 |
-| Stack alignment padding | `0xfae9 → 0xfaf0` |     7 |
-| Stack reserve           | `0xfaf0 → 0xfef0` | 1,024 |
-| `cube_frames`           | `0xfef0 → 0xff38` |    72 |
+| Item                          | Bytes |
+| ----------------------------- | ----: |
+| `cube_state`                  |    14 |
+| `cube_path`                   |    11 |
+| Stack alignment padding       |     7 |
+| Stack reserve                 | 1,024 |
+| Twelve six-byte `cube_frames` |    72 |
 
-The stack grows toward lower addresses. Thus, `__stack_top` and `cube_frames` both being located at `0xfef0` does not mean the two regions overlap.
+The downward-growing stack and the search-frame array occupy separate regions.
 
 $$
 \text{.bss}=14+11+7+1,024+72=\boxed{1,128\text{ B}}.
@@ -1119,7 +1248,7 @@ $$
 
 The search routine's 64-byte ABI frame and the replay routine's 16-byte frame use the existing stack reserve. They must not be counted again as additional static data.
 
-## 6.3 Static Data and the Limit
+## 7.3 Static Data and the Limit
 
 This ELF has no `.data` section, so its size is zero:
 
@@ -1129,31 +1258,15 @@ $$
 
 The 128 KiB limit equals 131,072 B, leaving 71,654 B unused. The image therefore meets the limit. `.text` occupies 1,804 B and is reported separately; it is not included in this assignment's static-data budget.
 
-`.symtab`, `.strtab`, and `.riscv.attributes` are analysis metadata rather than part of the static data above. Actual Ripes runs use the stripped `smoke.elf`, while symbol inspection uses `smoke.debug.elf`.
+## 7.4 Complete Hardest-state Performance
 
-## 6.4 Complete Hardest-state Performance
-
-Measurements use `/usr/bin/ripes`, package `ripes-git 2.2.6.r108.g0b4c65b-1`, Build ID `1b3e4f66c547c43ca72e2253150dbd67bdad1821`, processor `RV32_ISS`, and no extensions.
+Measurements use Ripes at commit `0b4c65b`, processor `RV32_ISS`, and no extensions.
 
 The `--iret` count covers the complete path through parsing, ranking, search, replay, output, and termination. The renderer is compiled out.
 
-### Measurement and Evidence Collection
+### Measurement Scope
 
-Exact BFS first enumerates the entire state space and exports **2,644 unique distance-11 inputs in ascending rank order**. The collector checks the complete histogram, each input's validity and dense rank, and the inclusion of the specified vector in the corpus.
-
-Each query uses the same immutable ELF, with only the fifteen-byte `cube_input` object replaced. The search code, tables, and stack layout are unchanged, and no precomputed solution is injected for individual test cases.
-
-[`measurements/rv32i-final.json`](measurements/rv32i-final.json) records more than the maximum:
-
-| Recorded data                               | Purpose                                                                |
-| ------------------------------------------- | ---------------------------------------------------------------------- |
-| `count=2644`, `gate=PASS`, `over_budget=0`  | Confirm complete coverage and the instruction-budget result            |
-| Simulator path / package / Build ID         | Identify the exact executable used for measurement                     |
-| Template / corpus / native-oracle hashes    | Prevent mixing versions when resuming collection                       |
-| Per-case index, rank, input, iret, and path | Retain every result instead of estimating the worst case from a sample |
-| Per-case ELF / raw-record hashes            | Reconstruct the input-only changes and verify the original records     |
-
-Finally, `export_gate_evidence.py` rechecks all records: the path must agree with the register nibbles, its length must be 11, independent replay must succeed, guest status must be 0, target final P/Q must be zero, and the applied count must be 11. The stack pointer, fingerprints, h, coordinates, output, and ISA must also agree.
+Exact BFS identifies **all 2,644 distance-11 inputs**, tested in ascending rank order. Each query runs the same search code and tables with a different input, and its returned path is checked for exact length and successful replay. No precomputed solution is injected for individual cases.
 
 ### Complete Results
 
@@ -1163,9 +1276,7 @@ Finally, `export_gate_evidence.py` rechecks all records: the path must agree wit
 | Maximum          | `14325671111111` |       **38,184,348** |
 | Specified vector | `21345671111111` |       **21,411,801** |
 
-The maximum occurs at corpus index 188, rank 192,456; the minimum at index 1,351, rank 1,672,939; and the specified vector at index 528, rank 524,880.
-
-All **2,644/2,644** distance-11 states passed, with zero over-budget cases. The maximum is **11,815,652 instructions (23.63%)** below 50,000,000. This is the maximum over the complete corpus, not an extrapolation from the earlier 606-case checkpoint.
+All **2,644/2,644** distance-11 states passed, with zero over-budget cases. The maximum is **11,815,652 instructions (23.63%)** below 50,000,000. It is the measured maximum over the complete corpus, not an extrapolation from a sample.
 
 The actual solution for the specified vector is:
 
@@ -1175,9 +1286,9 @@ R B' D2 R' B R' B' R D2 R B
 
 Total measurement elapsed time was **2,595.162 s (43 min 15 s)**, including per-query native checks, Ripes execution, and collection overhead—not simulator execution time alone.
 
-After the GUI and documentation changes, the final CLI executable remained byte-identical to the measured template. Its SHA-256 is `b412167f0e120fcdeed670a044eabfd544cca160a4d98b72e6363d66610431af`. Thus, the complete gate applies to the final renderer-off image.
+The [complete per-case results](https://github.com/HellHBBD/minirubik/blob/main/measurements/rv32i-final.json) are available for readers who want the full record.
 
-## 6.5 GCC Reference Comparison
+## 7.5 GCC Reference Comparison
 
 ### What Is Being Compared
 
@@ -1217,11 +1328,11 @@ The main differences occur in the hot loop executed for each candidate, rather t
 
 Thus, the handwritten version wins on code size and easy cases but cannot claim to retire fewer instructions in every case.
 
-The reference independently passes the 122-case matrix (27 valid / 95 invalid), 5,768 ranking records (1,732,434 iret), and 30,555 heuristic calls (1,453,562 iret). This checks that its lower instruction count does not come from weaker validation or different answers. The original compiler flags and reports are retained in the comparison records.
+The reference independently passes the 122-case matrix (27 valid / 95 invalid), 5,768 ranking records (1,732,434 iret), and 30,555 heuristic calls (1,453,562 iret). This checks that its lower instruction count does not come from weaker validation or different answers.
 
-# 7. LED Matrix Mapping
+# 8. LED Matrix Mapping
 
-## 7.1 Facelet Layout and Palette
+## 8.1 Facelet Layout and Palette
 
 The display data has three layers: fourteen cubie bytes in `cube_state`, 24 facelet color IDs, and 32-bit RGB words in the LED Matrix. The renderer reconstructs the display from the current logical state on every frame, using this unfolded net:
 
@@ -1244,7 +1355,7 @@ The LED Matrix is configured to **Width 35 and Height 25**. The Ripes settings p
 
 Each frame begins by clearing all **875 words** and then drawing 24×12 = **288 pixels**. Thus, empty slots, separators, and the remaining rows stay black rather than retaining pixels from the preceding frame.
 
-## 7.2 MMIO Addressing
+## 8.2 MMIO Addressing
 
 Each LED corresponds to one word. Row-major addressing uses:
 
@@ -1258,7 +1369,7 @@ Assembler expressions of the form `4 * (y * WIDTH + x)` generate the offsets of 
 
 The column-major formula in the Ripes peripheral description differs from the actual implementation. This version follows `y * WIDTH + x` as used in `examples/C/leds.c` and the LED painting code.
 
-## 7.3 Updating the Display from Cubies
+## 8.3 Updating the Display from Cubies
 
 The host geometry generator uses `+x=R`, `+y=U`, and `+z=F` to produce corner-to-facelet mappings. It also verifies that the R/B/D source and twist operations agree with the solver. The three face normals of each corner follow a consistent left-handed order, with color index `(j + orientation) mod 3`.
 
@@ -1270,7 +1381,7 @@ The cubie update first writes to a fourteen-byte scratch buffer and then copies 
 
 `RENDER=0/1` is selected at assembly time. There is no runtime branch that could bring renderer work into the CLI benchmark. The GUI's 50,000-iteration delay only slows down the display frames; its duration depends on the processor. Search and path results for the same input remain unchanged.
 
-## 7.4 Validation and Capture
+## 8.4 Validation and Capture
 
 The CLI has no I/O peripheral, so test-only symbols redirect the framebuffer to RAM. The program still runs the real solver, replay, and renderer. Independent 3D facelet rotations produce the expected pixels, and the validator compares every word and checks guards before and after the buffer:
 
@@ -1280,9 +1391,9 @@ The CLI has no I/O peripheral, so test-only symbols redirect the framebuffer to 
 | One R move                   |                  2 |             1,750 |
 | Specified distance-11 vector |                 12 |            10,500 |
 
-All **15 frames / 13,125 words** passed. Palette corruption was rejected. Switching from renderer-on back to renderer-off in the same directory also produced a byte-identical image, guarding against stale objects contaminating performance measurements. Production GUI builds do not contain expected-frame fixtures; the animation is not a playback of fixture data.
+All **15 frames / 13,125 words** passed. Production GUI builds do not contain expected-frame fixtures; the animation follows the computed path rather than playing back fixture data.
 
-The GUI image has **2,480 B** of `.text` and **59,670 B** of static data. Three frozen capture cases retain input/ELF hashes and expected frame counts of 1/2/12. `cube_frame_ready=0x1778` occurs after a full draw. A breakpoint can be set there; execution can step past that instruction and then run to the next frame.
+The GUI image has **2,480 B** of `.text` and **59,670 B** of static data. `cube_frame_ready=0x1778` occurs after a full draw. A breakpoint can be set there; execution can step past that instruction and then run to the next frame.
 
 The following initial and solved previews were generated and verified by the current version's framebuffer validator. They are **not** Ripes GUI screenshots:
 
@@ -1294,9 +1405,9 @@ The renderer-enabled `smoke.elf` was also loaded into the Ripes GUI and run on t
 
 ![Current distance-11 solved GUI](https://hackmd.io/_uploads/SJFxMJHize.png)
 
-# 8. Pipeline Walkthrough
+# 9. Pipeline Walkthrough
 
-## 8.1 Current Store/Load Trace
+## 9.1 Current Store/Load Trace
 
 `walkthrough.S` first sets `t1=10` and `t0=0x1050`, then executes:
 
@@ -1329,7 +1440,7 @@ The measured stage history is:
 
 ADD encounters a load-use stall at cycle 10. The hazard unit stalls the front end and inserts a bubble in ID/EX. In cycle 11, the load data is available through WB forwarding, allowing ADD to enter EX. These stages and the stall come from the actual `--pipeline` history, not an idealized schedule.
 
-## 8.2 Which Instruction Owns Each Control Signal?
+## 9.2 Which Instruction Owns Each Control Signal?
 
 In the `RV32_5S` wiring, `registerFile->wr_en` comes from MEM/WB, whereas `data_mem->wr_en` comes from EX/MEM. `reg_wr_src` selects the ALU result, memory read, or PC+4. The ALU operand multiplexers select REG1/PC and REG2/IMM.
 
@@ -1343,7 +1454,7 @@ Therefore, not every highlighted wire in a screenshot belongs to the selected in
 
 The same datapath is used by the solver: `lhu` reads an unsigned halfword from `row_base + 2 * coordinate`; `sh` stores child P/Q at offsets 0/2 of `cube_frames + 6 * depth`; and the renderer uses `sw` to write RGB words to MMIO. A store has no destination-register writeback.
 
-## 8.3 Observations from Reference Screenshots
+## 9.3 Observations from Reference Screenshots
 
 Screenshots from the completed reference implementation illustrate the following wire and memory behavior. **These values belong to the reference session and are not addresses from the current ELF**:
 
@@ -1357,7 +1468,7 @@ The register-write enable visible in the stage-history screenshot at cycle 903 b
 
 ![Reference SH and concurrent AUIPC](https://hackmd.io/_uploads/H1S4OAVjfe.png)
 
-## 8.4 Branching vs. Branchless Modulo-3
+## 9.4 Branching vs. Branchless Modulo-3
 
 The renderer's `orientation + twist` or `j + orientation` is at most four, so it can be reduced using:
 
@@ -1378,7 +1489,7 @@ Six pairs require no reduction and three require reduction. Thus, the branching 
 
 **Lower CPI does not necessarily mean faster execution.** Branchless has lower CPI on this workload but takes more total cycles. CPI alone cannot establish performance, nor can removing a branch be assumed to improve it. Raw JSON/TSV histories retain the complete trace for verification.
 
-# 9. Optimization and Development Summary
+# 10. Optimization and Development Summary
 
 The assembly was integrated through independently verifiable checkpoints rather than implemented in one step and judged only by its final output:
 
@@ -1389,16 +1500,40 @@ The assembly was integrated through independently verifiable checkpoints rather 
 | A3 Ranking             | Repeated addition for P, shift/add for Q, `a0/a1` ABI                      | Complete P/Q domains                                 |
 | A4 Heuristic           | Byte tables, mixed index, nibble extraction                                | All mixed entries                                    |
 | A5 Search              | Saved registers, 64 B ABI frame, six-byte search frames                    | Comparison with C solution length and path replay    |
-| A6 Replay / output     | Target validation, four-byte token slots, exit self-loop                   | Invalid paths / output negative controls             |
-| Measurements / display | Frozen images, GCC reference, RGB checks, pipeline traces                  | Complete hardest-state gate and implementation costs |
+| A6 Replay / output     | Target validation, four-byte token slots, exit self-loop                   | Returned-path replay, output, and ABI checks         |
+| Measurements / display | GCC reference, RGB checks, pipeline traces                                 | Complete hardest-state gate and implementation costs |
+
+## 10.1 Reproduced Historical Assembly Measurements
+
+Historical revisions were rebuilt from the listed commits with the same toolchain, renderer disabled, and Ripes commit `0b4c65b` using `RV32_ISS` without extensions. Code size is the complete linked `.text`; counts are raw `--iret` for the same input, including the work implemented at that checkpoint and the pinned ISS's post-exit retirement.
+
+The four input columns below are solved `12345671111111`, one move `25314672313211`, comparison `21345671111111`, and the final gate's known worst `14325671111111`:
+
+| Revision     | Source commit | Linked `.text`, B | Solved iret | One-move iret | Comparison iret | Known-worst iret |
+| ------------ | ------------- | ----------------: | ----------: | ------------: | --------------: | ---------------: |
+| A1           | `536f25a`     |               216 |         N/A |           N/A |             N/A |              N/A |
+| A2           | `577b4c1`     |               488 |         359 |           365 |             359 |              359 |
+| A3           | `3fe4059`     |               688 |         750 |           761 |             751 |              753 |
+| A4           | `8bcdc60`     |               840 |         783 |           800 |             784 |              792 |
+| A5           | `dd1d2d0`     |             1,460 |         878 |         1,232 |      21,411,040 |       38,183,571 |
+| A6           | `3cc046f`     |             1,804 |         938 |         1,355 |      21,411,801 |       38,184,348 |
+| Final source | `8142ddc`     |             1,804 |         938 |         1,355 |      21,411,801 |       38,184,348 |
+
+A1 does not consume input: its table-transfer entry retires **75 instructions**. A2–A4 stop after parsing, ranking, or heuristic lookup and do not solve the cube. A5 searches and returns a host-replayable path, but lacks target replay and complete solution output. A1–A5 use exit service 10; A6 uses status exit 93 and an explicit halt jump. The table uses the same ISS model throughout.
+
+Consequently, increases between A1–A6 measure added functionality, not regressions in an equivalent full query. The comparison input increases by 761 instructions from A5 to A6 while adding target replay, status checks, and solution output; that difference is not a claim that search became slower. Only A6 and the final source have equivalent full-entry scope, and their four counts and 1,804-byte `.text` are unchanged.
+
+These measurements document implementation checkpoints. **They do not establish an additional performance refinement of the complete handwritten solver.** The local modulo experiment in Section 9.4 is a measured kernel comparison, not a solver-level speedup. Proposed hot-loop changes remain unimplemented and unmeasured.
+
+## 10.2 Remaining Costs and Source Links
 
 The main remaining costs are repeated addition for `subset * 729` and the `depth * 6` frame-location loop inside the hot path. The GCC comparison shows that improving these two operations is more valuable than optimizing the one-time input ranking. However, an unimplemented shift/add alternative must not be presented as a measured speedup.
 
 Another result is that branchless modulo reduces CPI but increases total cycles. Both negative results are retained to provide measured evidence for future revisions.
 
-The code is available under [`riscv/`](riscv/). The complete gate export preserves all 2,644 counts and paths, with evidence frozen in commit `8142ddc`. The figures in this document are not performance results taken from another reference worktree.
+The code is available under [`riscv/`](https://github.com/HellHBBD/minirubik/tree/main/riscv). The measurements describe this implementation; labeled reference screenshots illustrate pipeline behavior without substituting another version's performance results.
 
-# 10. Conclusion
+# 11. Conclusion
 
 This implementation uses P/Q coordinates, an admissible heuristic, and explicit-frame IDA* to return optimal HTM solutions without heap allocation, recursion, or the M extension.
 
