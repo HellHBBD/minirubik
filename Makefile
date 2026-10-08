@@ -245,12 +245,18 @@ $(RV_BUILD)/calibration.elf: $(RV_BUILD)/calibration.debug.elf
 
 rv32i-calibration: $(RV_BUILD)/calibration.elf
 
-.PHONY: rv32i-gui rv32i-render-check
+.PHONY: rv32i-gui rv32i-render-check rv32i-pipeline-check rv32i-gui-evidence
 rv32i-gui:
 	$(MAKE) rv32i RV_BUILD=$(RV_BUILD)/gui RV_INPUT=$(RV_GUI_INPUT) RV_RENDER=1 RV_RENDER_TEST=0
 
 rv32i-render-check:
 	$(PYTHON) riscv/check_render.py
+
+rv32i-pipeline-check:
+	$(PYTHON) riscv/check_pipeline.py
+
+rv32i-gui-evidence:
+	$(PYTHON) riscv/prepare_gui_cases.py
 
 clean-rv32i:
 	$(RM) "$(RV_BUILD)/render.o" "$(RV_BUILD)/render-check.o" \

@@ -67,6 +67,10 @@ cube_render:
 #if RENDER_TEST
     jal ra, cube_render_check_frame
 #endif
+.globl cube_frame_ready
+.type cube_frame_ready, @notype
+cube_frame_ready:
+    nop
 #if RENDER_DELAY > 0
     li t0, RENDER_DELAY
 .Ldelay:
