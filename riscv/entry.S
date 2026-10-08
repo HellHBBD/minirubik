@@ -1,0 +1,198 @@
+/* A6: solve, replay on target, then print the actual shortest path.
+ * Ripes services: a7=4 prints the string at a0; a7=93 exits with a0 status.
+ * s0 records status (0=valid, 1=checkpoint failure, 2=invalid input).
+ * s1/s2 expose parsed bytes as fixed-width base-8/base-4 fingerprints;
+ * these diagnostics are not the Lehmer P or base-3 Q coordinates.
+ * s3/s4 expose the actual P/Q coordinates after a successful parse.
+ * s5 exposes the admissible heuristic.
+ * s6=length, s7/s8=path nibbles for independent host replay.
+ * s9/s10=target replay final P/Q, s11=number of applied moves.
+ */
+.option norvc
+.option norelax
+.section .text.entry, "ax", @progbits
+.globl _start
+.type _start, @function
+_start:
+    la sp, __stack_top
+    li s1, 0
+    li s2, 0
+    li s3, 0
+    li s4, 0
+    li s5, 0
+    li s6, -1
+    li s7, 0
+    li s8, 0
+    li s9, 0
+    li s10, 0
+    li s11, 0
+    la t0, cube_permutation_turn
+    la t1, cube_orientation_turn
+
+    /* R(solved): independently ranked P=1104 and Q=426. */
+    lhu t2, 0(t0)
+    li t4, 1104
+    bne t2, t4, .Lfail
+    lhu t3, 0(t1)
+    li t4, 426
+    bne t3, t4, .Lfail
+
+    /* Start from solved and apply four R quarter turns by table lookup. */
+    li t2, 0
+    li t3, 0
+    li t6, 4
+.Lturn:
+    slli t4, t2, 1
+    add t5, t0, t4
+    lhu t2, 0(t5)
+    slli t4, t3, 1
+    add t5, t1, t4
+    lhu t3, 0(t5)
+    addi t6, t6, -1
+    bnez t6, .Lturn
+    bnez t2, .Lfail
+    bnez t3, .Lfail
+
+    la t0, cube_permutation_distance
+    lbu t1, 0(t0)
+    bnez t1, .Lfail
+    la t0, cube_orientation_distance
+    lbu t1, 0(t0)
+    bnez t1, .Lfail
+    la t0, cube_permutation_subset
+    lbu t1, 0(t0)
+    bnez t1, .Lfail
+    la t0, cube_mixed_distance
+    lbu t1, 0(t0)
+    andi t1, t1, 15
+    bnez t1, .Lfail
+
+    la a0, cube_input
+    la a1, cube_state
+    jal ra, cube_parse_state
+    mv s0, a0
+    bnez a0, .Linvalid_input
+#if RENDER_TEST
+    jal ra, cube_render_test_init
+#endif
+#if RENDER
+    jal ra, cube_render
+#endif
+
+    /* Expose all fourteen parsed bytes for the host checker. */
+    la t0, cube_state
+    li t1, 7
+.Lfingerprint:
+    lbu t2, 0(t0)
+    li t4, 7
+    bgeu t2, t4, .Lfail
+    slli s1, s1, 3
+    or s1, s1, t2
+    lbu t3, 7(t0)
+    li t4, 3
+    bgeu t3, t4, .Lfail
+    slli s2, s2, 2
+    or s2, s2, t3
+    addi t0, t0, 1
+    addi t1, t1, -1
+    bnez t1, .Lfingerprint
+    la a0, cube_state
+    jal ra, cube_rank_state
+    mv s3, a0
+    mv s4, a1
+    li t0, 5040
+    bgeu s3, t0, .Lfail
+    li t0, 729
+    bgeu s4, t0, .Lfail
+    mv a0, s3
+    mv a1, s4
+    jal ra, cube_heuristic
+    mv s5, a0
+    mv a0, s3
+    mv a1, s4
+    la a2, cube_path
+    jal ra, cube_solve
+    mv s6, a0
+    blt a0, zero, .Lfail
+    li t0, 11
+    bltu t0, a0, .Lfail
+    li t0, 0
+    la t1, cube_path
+.Lpath:
+    bgeu t0, s6, .Lpath_done
+    lbu t2, 0(t1)
+    li t3, 9
+    bgeu t2, t3, .Lfail
+    li t3, 8
+    bgeu t0, t3, .Lpath_high
+    slli t3, t0, 2
+    sll t2, t2, t3
+    or s7, s7, t2
+    j .Lpath_next
+.Lpath_high:
+    addi t3, t0, -8
+    slli t3, t3, 2
+    sll t2, t2, t3
+    or s8, s8, t2
+.Lpath_next:
+    addi t0, t0, 1
+    addi t1, t1, 1
+    j .Lpath
+.Lpath_done:
+    mv a0, s3
+    mv a1, s4
+    la a2, cube_path
+    mv a3, s6
+    jal ra, cube_replay
+    mv s9, a1
+    mv s10, a2
+    mv s11, a3
+    bnez a0, .Lfail
+    bne s11, s6, .Lfail
+    la a0, cube_path
+    mv a1, s6
+    jal ra, cube_print_path
+    j .Lexit
+.Linvalid_input:
+    la a0, .Linvalid_message
+    j .Lreport
+.Lfail:
+    li s0, 1
+    la a0, .Lfail_message
+.Lreport:
+    li a7, 4
+    ecall
+.Lexit:
+    mv a0, s0
+    li a7, 93
+    ecall
+.Lhalt:
+    j .Lhalt
+.size _start, .-_start
+
+.section .rodata.smoke, "a", @progbits
+.Linvalid_message:
+    .asciz "Invalid cube state\n"
+.Lfail_message:
+    .asciz "RV32I solver verification failed\n"
+
+.section .bss.cube_state, "aw", @nobits
+.balign 4
+.globl cube_state
+.type cube_state, @object
+cube_state:
+    .space 14
+.size cube_state, .-cube_state
+
+.section .bss.path, "aw", @nobits
+.globl cube_path
+.type cube_path, @object
+cube_path:
+    .space 11
+.size cube_path, .-cube_path
+
+.section .bss.stack, "aw", @nobits
+.balign 16
+    .space 1024
+.globl __stack_top
+__stack_top:

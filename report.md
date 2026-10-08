@@ -1,460 +1,1407 @@
-# The Mini-Rubik and Its C99 Solver
+# Optimizations and RISC-V Assembly
 
-This report describes the 2×2×2 Rubik’s Cube as a finite state graph and explains the design, algorithmic complexity, and formal validation of the C99 solver in `solver.c`.
+# 1. State Space, Group, and HTM Diameter
 
-## Result
+## 1.1 Group and State Space
 
-The Mini-Rubik is the 2×2×2 Rubik’s Cube (also known as the Pocket Cube). With one corner fixed to eliminate whole-cube rotations, its reachable state space contains exactly:
+### Conclusion
 
-$$
-7! \times 3^6 = 5{,}040 \times 729 = 3{,}674{,}160
-$$
-
-configurations. Counting the 24 whole-cube rotations as distinct positions instead gives $8! \times 3^7 = 88{,}179{,}840$, which is exactly $24 \times 3{,}674{,}160$; fixing one corner divides that factor out, and the solver works in the quotient.
-
-In the half-turn metric (HTM), where quarter turns ($90^\circ$), inverse quarter turns ($-90^\circ$), and half turns ($180^\circ$) each count as a single move, the Cayley graph diameter is exactly 11. Every valid state can be solved in at most 11 moves. In the quarter-turn metric, where a half turn costs two moves, the diameter is 14; this solver measures and reports the HTM value.
-
-```diagram
-     ┌──────────────────────────────────┐
-     │ Fix corner 0 at front-upper-left │
-     └──────────────────────────────────┘
-                       │
-        ┌──────────────▾──────────────┐
-        │ 7 positions, 7 orientations │
-        └─────────────────────────────┘
-                       │
-  ┌────────────────────▾───────────────────┐
-  │ Permutation and orientation invariants │
-  └────────────────────────────────────────┘
-                       │
-      ┌────────────────▾────────────────┐
-      │ Lehmer rank x 729 + base-3 rank │
-      └─────────────────────────────────┘
-                       │
-          ┌────────────▾───────────┐
-          │ 3,674,160 dense states │
-          └────────────────────────┘
-```
-
-## 1. From a Physical Puzzle to a State Graph
-
-Ernő Rubik built the first cube prototype in 1974 as an architectural model to demonstrate 3D kinematic movement: pieces move independently without the structure falling apart. The standard 3×3×3 cube has 8 corner cubies, 12 edge cubies, and 6 fixed centers, resulting in:
+After fixing a reference corner, the group considered for Mini-Rubik is
 
 $$
-\frac{8! \times 3^7 \times 12! \times 2^{11}}{2} \approx 4.33 \times 10^{19}
+G=\langle R,B,D\rangle,
 $$
 
-reachable configurations. Enumerating or exploring that state space directly via uniform search is computationally infeasible.
+with order
 
-[Philo Li’s formula-free tutorial](https://philoli.com/zh/blog/solve-rubiks-cube-without-formulas/) presents an algebraic mental model rather than rote sequence memorization. Face turns are permutations of cubies and orientations governed by three group-theoretic properties:
+$$
+|G|=7!\times3^6=3,674,160.
+$$
 
-- Composition: turns compose to produce subsequent permutations ($g_1 \circ g_2 \in G$).
-- Inverses: every turn can be inverted ($g \circ g^{-1} = e$).
-- Order sensitivity: cube moves generally do not commute ($R U \neq U R$).
+### Proof
 
-Human solvers exploit these properties via commutators, $[A, B] = A B A^{-1} B^{-1}$. Moving a target piece into a working area with $A$, modifying that area with $B$, and applying $A^{-1} B^{-1}$ leaves the rest of the cube invariant while applying local changes. Philo Li applies this intuition to human 3×3×3 Roux-style solving: block building, corner resolution, and edge orientation and placement.
+#### Step 1: How many configurations satisfy the constraints?
 
-The 2×2×2 solver addresses a simpler permutation group. A 2×2×2 cube contains no edge cubies and no centers. Instead of human multi-phase heuristics or commutator generation, this solver represents the complete Cayley graph of the 2×2×2 cube and solves any position optimally using precomputed retrograde search, the classical approach to small permutation groups set out by Cooperman and Finkelstein [2].
+A 2×2 cube has eight corners. Fixing the position and orientation of one reference corner removes equivalence caused by whole-cube rotations, so only the remaining seven corners need to be represented.
 
-The two columns describe different puzzles, human 3×3×3 solving against a 2×2×2 program, so the comparison is one of method rather than of move counts:
+The seven corners have
 
-| View | Human formula-free solving | This C99 solver |
-| :--- | :--- | :--- |
-| State representation | Visual features and partially solved blocks | Dense 32-bit integer rank |
-| Move selection | Target tracking and protecting solved blocks | Single table lookup pointing toward solved |
-| Strategy | Composing local commutators $[A, B]$ | Retrograde breadth-first search (BFS) |
-| Optimality guarantee | None | Strictly optimal (at most 11 moves in HTM) |
+$$
+7!=5040
+$$
 
-## 2. Mini-Rubik Model
+possible permutations.
 
-The 2×2×2 cube consists of 8 corner cubies. Fixing one corner, specifically cubie 0 at the front-upper-left (FUL) position, removes the 24 whole-cube rotational symmetries. The remaining 7 physical positions and cubies are indexed 1 through 7 in this report; `solver.c` indexes the same seven slots 0 through 6 in the arrays `state_t.p` and `state_t.o`, so report position $i$ is array index $i - 1$.
+Each corner has three possible orientations, but a legal state must satisfy
 
-Orientations are cyclic twists in $\mathbb{Z}_3$:
+$$
+\sum_{i=0}^{6}o_i\equiv0\pmod3.
+$$
 
-- `1` (internal `0`): solved orientation.
-- `2` (internal `1`): clockwise twist ($+120^\circ$).
-- `3` (internal `2`): counterclockwise twist ($+240^\circ \equiv -120^\circ$).
+The seventh orientation is therefore determined by the first six, leaving
 
-Two symbols are used for these throughout the report: $d_i \in \{1, 2, 3\}$ is the input digit at position $i$, and $o_i = d_i - 1 \in \{0, 1, 2\}$ is the internal value stored in `state_t.o`.
+$$
+3^6=729
+$$
 
-### Unfolded Face Net
+independent orientation configurations.
 
-The fixed corner is marked as `0`. Each corner appears on three adjacent faces. This is an exterior unfold: every face is drawn as seen from outside the cube, so the back face reads `4 7` from left to right. `README.md` draws the back layer the other way, `7 4`, because it looks through the cube from the front; both describe the same corners.
+Let $S$ be the set of configurations satisfying these permutation and orientation constraints. Its size is
 
-```diagram
-                         UP
-                      ┌───┬───┐
-                      │ 7 │ 4 │
-                      ├───┼───┤
-                      │ 0 │ 1 │
-                      └───┴───┘
+$$
+|S|=5040\times729=3,674,160.
+$$
 
-       LEFT              FRONT             RIGHT              BACK
-    ┌───┬───┐         ┌───┬───┐         ┌───┬───┐         ┌───┬───┐
-    │ 7 │ 0 │         │ 0 │ 1 │         │ 1 │ 4 │         │ 4 │ 7 │
-    ├───┼───┤         ├───┼───┤         ├───┼───┤         ├───┼───┤
-    │ 6 │ 3 │         │ 3 │ 2 │         │ 2 │ 5 │         │ 5 │ 6 │
-    └───┴───┘         └───┴───┘         └───┴───┘         └───┴───┘
+---
 
-                        DOWN
-                      ┌───┬───┐
-                      │ 3 │ 2 │
-                      ├───┼───┤
-                      │ 6 │ 5 │
-                      └───┴───┘
-```
+#### Step 2: Every state generated by $G=\langle R,B,D\rangle$ belongs to $S$
 
-The solved state vector across moving positions $1 \dots 7$ is:
+Starting from the solved state, any sequence of `R`, `B`, and `D` turns preserves:
+
+- the validity of the cubie permutation;
+- the orientation range;
+- the orientation-sum invariant;
+- the fixed reference corner.
+
+Let $\mathcal{O}$ denote the set of states reachable from solved using these turns. Then
+
+$$
+\mathcal{O}\subseteq S.
+$$
+
+Each element of $G$ is uniquely identified by its action on the fully labeled solved cube. Thus, the reachable states correspond one-to-one with group elements, and
+
+$$
+|G|=|\mathcal{O}|.
+$$
+
+---
+
+#### Step 3: Exhaustive BFS establishes the reverse inclusion
+
+Next, perform exhaustive BFS from the solved state.
+
+If:
+
+- BFS visits 3,674,160 distinct states; and
+- $S$ contains exactly 3,674,160 configurations,
+
+then BFS has reached every configuration in $S$. Therefore,
+
+$$
+S\subseteq\mathcal{O}.
+$$
+
+The measured BFS distribution sums to exactly 3,674,160, and the complete search covers the entire configuration domain.
+
+Together,
+
+$$
+\mathcal{O}\subseteq S
+\qquad\text{and}\qquad
+S\subseteq\mathcal{O},
+$$
+
+so
+
+$$
+\mathcal{O}=S.
+$$
+
+Hence,
+
+$$
+\boxed{|G|=7!\times3^6=3,674,160}.
+$$
+
+## 1.2 Cayley Graph and Generators
+
+### Conclusion
+
+Each legal cube state can be viewed as a vertex of a Cayley graph, and each allowed HTM move corresponds to an edge.
+
+The generator set is
+
+$$
+\{R,R^2,R',B,B^2,B',D,D^2,D'\}.
+$$
+
+In HTM, `R`, `R2`, and `R'` all have cost 1.
+
+### Explanation
+
+After fixing the reference corner, the legal Mini-Rubik states can be represented by a Cayley graph.
+
+Each legal cube state corresponds to a vertex. If applying one allowed HTM move to a state produces another state, an edge connects them.
+
+The move set used by the HTM search is
+
+$$
+\{R,R^2,R',B,B^2,B',D,D^2,D'\}.
+$$
+
+Each face therefore has three nonidentity moves:
 
 ```text
-positions:     1 2 3 4 5 6 7
-orientations:  1 1 1 1 1 1 1
+R   R2   R'
+B   B2   B'
+D   D2   D'
 ```
 
-### Generators and Move Cycles
+Thus, each state has nine neighboring states in this graph.
 
-Because corner 0 is fixed at the intersection of faces Up ($U$), Front ($F$), and Left ($L$), turning any of those three faces would move corner 0. Every transformation of the quotient can therefore be expressed through the three opposite faces: Right ($R$), Back ($B$), and Down ($D$).
+> [!NOTE]
+> It is important to distinguish the number of underlying state transitions from the cost of one HTM move. For example, if the program's primitive operation is a quarter turn, `R2` requires two consecutive `R` transitions, while `R'` can be implemented using three:
+>
+> $$
+> R^2=R\cdot R,\qquad R'=R^3.
+> $$
+>
+> However, in the half-turn metric (HTM), `R`, `R2`, and `R'` are each considered one face move:
+>
+> $$
+> \operatorname{cost}(R)=\operatorname{cost}(R^2)=\operatorname{cost}(R')=1.
+> $$
+>
+> The same applies to `B` and `D`.
 
-In the half-turn metric, each face has 3 non-trivial rotations ($90^\circ$, $180^\circ$, $270^\circ$), yielding 9 generator moves:
+Each edge in this Cayley graph therefore represents one HTM move, not necessarily one quarter-turn transition. A shortest solution from a state to solved is the corresponding shortest path in this graph.
 
-```text
-R, R2, R'     B, B2, B'     D, D2, D'
-```
-
-A bare letter is a $90^\circ$ turn clockwise as seen from outside that face, `'` is its inverse, and `2` is a half turn. Each quarter turn performs a 4-cycle on corner positions and leaves the other three moving corners alone. The arrows below trace where a cubie travels; the number in parentheses is the twist added to whatever lands in that position, matching `source[face][]` and `twist[face][]` in `solver.c`:
-
-```diagram
-  R: right face           B: back face            D: down face
-
-  1(+1) ──▸ 4(+2)         4(+1) ──▸ 7(+2)         2 ──▸ 5
-    ▴         │             ▴         │           ▴     │
-    │         ▾             │         ▾           │     ▾
-  2(+2) ◂── 5(+1)         5(+2) ◂── 6(+1)         3 ◂── 6
-```
-
-### Orientation Changes under Quarter Turns
-
-1. Right turn ($R$):
-   - Positions 1 (FUR) and 5 (BDR) increment orientation: $+1 \pmod 3$.
-   - Positions 4 (BUR) and 2 (FDR) decrement orientation: $+2 \pmod 3$.
-   - Net orientation delta: $1 + 2 + 1 + 2 = 6 \equiv 0 \pmod 3$.
-2. Back turn ($B$):
-   - Positions 4 (BUR) and 6 (BDL) increment orientation: $+1 \pmod 3$.
-   - Positions 5 (BDR) and 7 (BUL) decrement orientation: $+2 \pmod 3$.
-   - Net orientation delta: $1 + 2 + 1 + 2 = 6 \equiv 0 \pmod 3$.
-3. Down turn ($D$):
-   - All 4 corners rotate within the down plane without changing their relation to the Up/Down reference axis ($+0 \pmod 3$).
-   - Net orientation delta: $0 \equiv 0 \pmod 3$.
-
-Every generator turn preserves the total twist modulo 3: every turn leaves $\sum_{i=1}^{7} o_i \bmod 3$ unchanged, and the solved state has $\sum o_i = 0$, so every reachable state satisfies $\sum_{i=1}^{7} o_i \equiv 0 \pmod 3$. That is the constraint `valid` checks and the reason the seventh orientation carries no information.
-
-## 3. Compact State Representation
-
-This section indexes cubies by the internal indices 0 through 6, and $o_i$ keeps the meaning fixed in section 2: the internal orientation `state_t.o[i]`. A physical state is valid if and only if it satisfies two invariants:
-
-1. Permutation validity: the seven entries of `state_t.p` form a bijection of the internal cubie indices $\{0, 1, 2, 3, 4, 5, 6\}$, which are the report's cubies 1 through 7 shifted down by one.
-2. Orientation constraint: every internal orientation $o_i \in \{0, 1, 2\}$, and the sum across all cubies is divisible by 3:
+Every move has an inverse, for example,
 
 $$
-\sum_{i=0}^6 o_i \equiv 0 \pmod 3
+R^{-1}=R'.
 $$
 
-Because the orientation sum is constrained modulo 3, the orientation of the 7th cubie is uniquely determined by the first 6:
+A state can therefore return to its predecessor by applying the inverse move. For shortest-path analysis, adjacency can be treated as bidirectional.
+
+This definition also determines the meaning of BFS distance: BFS depth counts HTM moves, not the total number of quarter-turn transitions executed internally.
+
+## 1.3 Exhaustive BFS and Diameter
+
+### Conclusion
+
+Exhaustive BFS establishes that Mini-Rubik has diameter
 
 $$
-o_6 = (3 - (\sum_{i=0}^5 o_i \bmod 3)) \bmod 3
+\boxed{11}
 $$
 
-### Bijective Indexing
+under this HTM move set.
 
-The state is encoded into a dense integer in the range $[0, 3{,}674{,}160)$ using two rank components:
+### Proof
 
-1. Permutation Lehmer rank ($p \in [0, 7!)$), computed with the factoradic numeral system:
+The BFS used in Section 1.1 also records the shortest depth of every state. Its distance distribution is:
 
-   $$
-   p = \sum_{i=0}^6 c_i \times (6 - i)!, \quad c_i = \sum_{j=i+1}^6 [s.p[j] < s.p[i]]
-   $$
+| HTM Distance | Number of States |
+| -----------: | ---------------: |
+|            0 |                1 |
+|            1 |                9 |
+|            2 |               54 |
+|            3 |              321 |
+|            4 |            1,847 |
+|            5 |            9,992 |
+|            6 |           50,136 |
+|            7 |          227,536 |
+|            8 |          870,072 |
+|            9 |        1,887,748 |
+|           10 |          623,800 |
+|           11 |            2,644 |
+|    **Total** |    **3,674,160** |
 
-   `rank_state` evaluates this by Horner's rule, `p = p * (7 - i) + c_i`, which needs no factorial table and keeps every partial value below 5,040.
+First, there are 2,644 states at depth 11. Therefore, at least one state has shortest distance 11 from solved:
 
-2. Orientation rank ($o \in [0, 3^6)$), evaluated as a base-3 integer over the first 6 orientations:
+$$
+\operatorname{diameter}\ge11.
+$$
 
-   $$
-   o = \sum_{i=0}^5 s.o[i] \times 3^{5 - i}
-   $$
+Second, BFS visits all 3,674,160 legal states, and the largest recorded depth is 11. No state remains at depth 12 or beyond.
 
-3. Composite rank:
+Because a Cayley graph is vertex-transitive, the maximum shortest distance from solved equals the graph's diameter. Therefore,
 
-   $$
-   \text{rank} = p \times 729 + o
-   $$
+$$
+\operatorname{diameter}\le11.
+$$
 
-This encoding is a bijection between valid physical configurations and array indices in $[0, 3{,}674{,}160)$. Valmari [3] treats this same puzzle as a case study in how far a dense encoding can shrink the table, and reaches the same conclusion that the orientation of the last cubie is redundant. `unrank_state` inverts it: it peels factoradic digits off $p$ against a shrinking list of unused cubies, reads the six base-3 digits of $o$, and recomputes the seventh orientation from the parity constraint. The executable self-test checks the round trip on every one of the 3,674,160 ranks.
+Combining both bounds gives
 
-## 4. Solver Construction
+$$
+\boxed{\operatorname{diameter}=11}.
+$$
 
-The solver uses retrograde breadth-first search starting from the solved state (rank 0). All 9 generators cost one move, so a FIFO queue dequeues states in nondecreasing distance from solved and the first visit to a state is along a shortest path. Because every move $m$ has an inverse $m^{-1}$ with $m \circ m^{-1} = e$, when the search steps from an already-settled state $u$ to an unvisited $v$ via $m$, the move $m^{-1}$ takes $v$ back to $u$, one step closer to solved. The table stores that inverse, one byte per state, and following it from any state walks a shortest path home.
+# 2. Stage 1 — Baseline Analysis
 
-Before BFS, the implementation builds separate quarter-turn transition tables for the 5,040 permutation ranks and the 729 orientation ranks. This factoring is exact rather than an approximation: a quarter turn of face $f$ sets $p'[i] = p[\text{source}[f][i]]$ and $o'[i] = (o[\text{source}[f][i]] + \text{twist}[f][i]) \bmod 3$, so the new permutation depends only on the old permutation and the new orientation vector only on the old orientation vector. The composite rank therefore splits, advances componentwise by table lookup, and recombines as $p' \times 729 + o'$. Applying each face transition one, two, or three times produces the quarter, half, and inverse turns without reconstructing or re-ranking a `state_t` in the hot loop, which is what keeps 33 million edge expansions cheap.
+## 2.1 Baseline Solver
 
-```diagram
-           ┌──────────────────────┐
-           │ solved state, rank 0 │
-           └──────────────────────┘
-                       │
-   ┌───────────────────▾──────────────────┐
-   │ factor quarter turns into two tables │
-   └──────────────────────────────────────┘
-                       │
-  ┌────────────────────▾──────────────────┐
-  │ BFS level by level: pop rank, apply 9 │
-  │            generator moves            │
-  └───────────────────────────────────────┘
-                       │
-   ┌───────────────────▾─────────────────┐
-   │ first visit: toward_solved[there] = │
-   │            inverse move             │
-   └─────────────────────────────────────┘
-                       │
-       ┌───────────────▾───────────────┐
-       │ queue empty: 3,674,160 states │
-       │      over depths 0 to 11      │
-       └───────────────────────────────┘
-                       │
-    ┌──────────────────▾────────────────┐
-    │ free queue, retain 3.50 MiB table │
-    └───────────────────────────────────┘
-```
+### Conclusion
 
-A query then walks the table:
+The baseline performs exhaustive BFS from solved and precomputes shortest-path information for every state. Specifically, `toward_solved` stores one **inverse move leading toward solved** for each state, rather than a complete solution or an explicit distance.
 
-```diagram
-             ┌───────────────────┐
-             │ 14-digit argument │
-             └───────────────────┘
-                       │
-  ┌────────────────────▾────────────────────┐
-  │ parse_state: digits, permutation, twist │
-  │                   sum                   │
-  └─────────────────────────────────────────┘
-                       │
-          ┌────────────▾─────────────┐
-          │ rank_state: dense rank r │
-          └──────────────────────────┘
-                       │
-  ┌────────────────────▾─────────────────────┐
-  │ r nonzero: emit move table[r], apply it, │
-  │                 re-rank                  │
-  └──────────────────────────────────────────┘
-                       │
-        ┌──────────────▾───────────────┐
-        │ r = 0 after at most 11 moves │
-        └──────────────────────────────┘
-```
+All nine moves have unit cost, and the FIFO queue expands states in nondecreasing distance order. When a state is first discovered, its BFS predecessor is in the previous layer. Following the stored inverse moves back to solved therefore produces a shortest solution.
 
-`toward_solved[0]` is written as 0 when the search starts, but the solve loop exits on rank 0, so that byte is never read.
+- **Advantage:** shortest solutions are guaranteed, and queries are inexpensive.
+- **Disadvantage:** the complete BFS table and queue require far more memory than the target budget allows.
 
-### Memory Footprint and Performance
-
-`build_table` holds three allocations simultaneously, and their sum is the high-water mark for the whole program:
-
-| Allocation | Size | Storage |
-| :--- | ---: | :--- |
-| `toward_solved`, one move byte per state | 3,674,160 B, 3.504 MiB | heap |
-| `queue`, one 4-byte rank per state | 14,696,640 B, 14.016 MiB | heap |
-| Transition tables, $3 \times (5{,}040 + 729)$ `uint16_t` | 34,614 B, 33.80 KiB | automatic, in `build_table` |
-| Computed peak | 18,405,414 B, 17.553 MiB | |
-
-The queue accounts for 79.8% of that. It is sized to the entire state space rather than to an estimated frontier, and the sizing is exact rather than pessimistic: BFS enqueues each reachable state exactly once, every one of the 3,674,160 states is reachable, so `tail` finishes at precisely `STATES`. That identity is what `build_table` tests to decide the search was complete. A rank needs only 22 bits, since $3{,}674{,}160 < 2^{22}$, so three-byte entries would save 3.5 MiB, but `uint32_t` keeps the indexing a single shift-free load and the queue is freed before its size matters to anything else.
-
-### Computed Against Measured
-
-Peak resident set size on the development machine (Apple silicon, `cc -O3 -std=c99`), measured with `/usr/bin/time -l`:
-
-| Run | Peak RSS | Computed | Difference |
-| :--- | ---: | ---: | ---: |
-| `./solver 21345671111111` | 19,808,256 B, 18.89 MiB | 17.553 MiB | 1.338 MiB |
-| `./solver --self-test` | 19,808,256 B, 18.89 MiB | 17.553 MiB | 1.338 MiB |
-| `./mini 21345671111111` | 56,524,800 B, 53.91 MiB | 52.559 MiB | 1.347 MiB |
-
-Each figure is the maximum over eight runs on an idle machine, four in the case of `--self-test`. Under load the readings scatter downward, by as much as 15 MiB for `mini`, because the high-water mark counts only pages actually resident and the kernel reclaims under pressure; occasional readings land a single page higher. The maximum on an idle machine is the figure worth quoting, and it is the one that matches the arithmetic.
-
-The gap is a fixed process baseline, not allocator overhead that scales with the request. A control program that allocates and touches exactly 100 MiB measures 106,233,856 B, which is 1.313 MiB above its own arithmetic, and the three rows above sit within 10 KiB of each other on that same margin despite differing by 35 MiB in what they allocate. The computed column is therefore the one to reason about when changing the design; add roughly 1.34 MiB to predict what the process will occupy.
-
-The peak is also transient. Once BFS completes, the queue is freed and the transition tables leave scope, so the program holds 3.504 MiB for the entire query phase and exits from there. Nothing in the design requires the peak to persist, which is what makes the queue worth removing; section 7 describes how to do that and bring the peak to within 34 KiB of the retained figure.
-
-Timing on the same machine, reported as the minimum of seven runs on an idle machine, since every figure here moves by half again under load: `./solver 21345671111111` takes 0.065 s wall clock and `./solver 12345671111111`, an already-solved cube needing zero moves, takes the same 0.065 s, so table construction is effectively the entire runtime and the query itself is unmeasurable beside it. `./solver --self-test` takes 0.145 s, since it additionally unranks, validates, and re-ranks every one of the 3,674,160 states before building the table. An invalid argument returns in 0.002 s, because validation precedes any allocation.
-
-### Exact Distance Distribution (God's Algorithm in HTM)
-
-Exhaustive breadth-first search of the complete state space reveals the exact distance distribution:
-
-| Distance ($d$) | States at distance $d$ | Cumulative states | Percentage |
-| :---: | ---: | ---: | ---: |
-| 0 | 1 | 1 | < 0.001% |
-| 1 | 9 | 10 | < 0.001% |
-| 2 | 54 | 64 | 0.001% |
-| 3 | 321 | 385 | 0.009% |
-| 4 | 1,847 | 2,232 | 0.050% |
-| 5 | 9,992 | 12,224 | 0.272% |
-| 6 | 50,136 | 62,360 | 1.365% |
-| 7 | 227,536 | 289,896 | 6.193% |
-| 8 | 870,072 | 1,159,968 | 23.681% |
-| 9 | 1,887,748 | 3,047,716 | 51.379% |
-| 10 | 623,800 | 3,671,516 | 16.978% |
-| 11 | 2,644 | 3,674,160 | 0.072% |
-| Total | 3,674,160 | — | 100.0% |
-
-The maximum distance to solved is 11, confirming God's Number for the 2×2×2 Rubik's Cube in the half-turn metric. Over 51% of all states require exactly 9 moves, and 92.0% require between 8 and 10 moves. The distribution is sharply peaked: a uniformly random scramble is almost never easy, and the 2,644 hardest states are 0.072% of the space. Only the diameter is checked by the program itself; the per-level counts above come from the same BFS instrumented to record levels.
-
-## 5. C99 Interface
-
-### Build and Verification
-
-```sh
-make          # builds solver and mini
-make check    # executable tests, about five seconds
-make prove    # Frama-C WP on solver.c, about eight seconds warm
-```
-
-`make check` runs three things: the exhaustive self-test, a set of solution vectors, and a set of rejection cases.
-
-The vectors live in `tests/solutions.txt` as `state|solution` pairs and cover distances 0, 8, 8, 8, 9, 9, 10, and 11, the last being the sample state `21345671111111`. Both binaries must reproduce every one. The pairs were not taken on trust from the solver that produced them: each was checked against an independent model of `source[][]` and `twist[][]`, confirming that the printed moves solve the state and that the move count equals the true BFS distance, so the vectors pin optimality and not merely stability. That independent model also reproduced 3,674,160 reachable states at diameter 11 from the same tables.
-
-The comparison is byte-exact, `cmp` against a file holding the expected line and its terminating newline, so trailing whitespace and stray blank lines fail the target as surely as a wrong move does; a shell string comparison would not catch either, because command substitution strips trailing newlines. Exit status is checked separately. Mutation testing confirms the gate bites: a reintroduced trailing space, an extra newline, a corrupted entry in `move_names`, a divergence in `mini` alone, and a nonzero exit are each caught.
-
-The rejection cases drive one input per validation path, short, long, cubie digit below and above range, orientation digit below and above range, a non-digit, a duplicate cubie, and a parity violation, plus the no-argument and two-argument cases, and require status 2 from both binaries. Having `mini` run the same list is what keeps its silent, independent validation path honest, since it shares no code with `parse_state`.
-
-`make prove` is kept separate because it needs Frama-C and Alt-Ergo installed, which the runtime tests do not, and it costs about eight seconds against `make check`'s five. Neither target depends on the other; CI runs `make check` on every push and `make prove` as a second job.
-
-### Test Coverage
-
-Measured with `llvm-cov` over exactly what `make check` executes:
-
-| Metric | Self-test only | Full `make check` |
-| :--- | ---: | ---: |
-| Region coverage | 67.3% | 88.9% |
-| Line coverage | 73.8% | 88.5% |
-| Branch coverage | 59.6% | 84.6% |
-| Function coverage | 90.0% | 100% |
-
-The self-test drives the model directly and never calls `parse_state` at all, which is why the rejection cases matter disproportionately. What remains uncovered is deliberate, and it divides into three kinds. Only the `malloc` failure return in `build_table` and the `main` path reporting it need allocation failure to reach; interposing on `malloc` is more machinery than that risk justifies. The incompleteness return, the diameter check, and the `self_test` failure returns all need the code to be already broken, which is the same category as an assertion that never fires. The range-check rejection inside `valid` is unreachable from the CLI because `parse_state` validates digit ranges before calling it; that branch is not dead code but the thing that makes `valid`'s contract self-contained, and WP proves it rather than leaving it to a test. The `argv[0]` null guard needs an `exec` with an empty argument vector, which no hosted shell produces.
-
-The failure side of `output_failed` is not in any of those categories and is now tested directly: `make check` runs both binaries and the self-test with stdout closed and requires status 1. That case was the one genuinely reachable gap, and a mutant that reverts `output_failed` to an unconditional success is caught by it.
-
-### The Compact Variant
-
-`mini.c` solves the same inputs as `solver.c` and prints the same line. The two were checked against each other on 1,210 argument strings, 400 of them valid scrambles and the rest random bytes, edge-case lengths, and malformed digits: identical exit codes and byte-identical stdout on every one. `make check` enforces that agreement on the 8 solution vectors and the full rejection set; the 1,210-string run is the wider, unenforced sample. It exists as a readability contrast, not as a faster or smaller program, and it differs in four ways worth stating:
-
-- No `--self-test`. `mini` rejects the flag with status 2.
-- No diagnostics. Where `solver` writes a usage line or an allocation failure to stderr, `mini` is silent and communicates only through its exit status.
-- Slower by roughly eight times, 0.51 s against 0.065 s, because it re-ranks a full `state_t` on every one of the 33 million expansions instead of using the factored transition tables of section 4.
-- Larger by roughly three times at peak, 52.56 MiB computed and 53.91 MiB measured against `solver`'s 17.553 MiB and 18.89 MiB, because its queue holds 14-byte `state_t` values rather than 4-byte ranks: $3{,}674{,}160 \times 14 = 49.06$ MiB of queue where `solver` needs 14.016 MiB.
-
-"Compact" therefore refers to source size alone.
-
-### CLI Scramble Input
-
-The program takes one argument containing exactly 14 digits:
+### Flow
 
 ```text
-PPPPPPP OOOOOOO
-positions orientations
+solved state
+    ↓
+exhaustive BFS
+    ↓
+build shortest-step information for every state
+    ↓
+query state
+    ↓
+rank_state()
+    ↓
+look up the next move
+    ↓
+repeat until solved
 ```
 
-The space above is explanatory and is not present in the actual argument.
+### `rank_state()`
 
-- Digits 1–7 (`P`) identify which cubie occupies physical positions 1–7 and must form a permutation of `1234567`.
-- Digits 8–14 (`O`) describe the orientation at those same positions: `1` means solved, `2` means $+120^\circ$, and `3` means $-120^\circ$.
-- The sum of the internal orientation values (`digit - 1`) must be divisible by 3.
+#### Purpose
 
-The solved state is `12345671111111`; solving it prints an empty line, since zero moves are needed. A direct rank would be shorter but would expose the implementation's Lehmer and base-3 encoding and would be difficult to read off a physical cube; the digit form keeps the CLI compact and inspectable.
+Establish a one-to-one mapping between a legal `state_t` and its rank, used as an array index:
 
-For example, a scrambled position:
+$$
+(p[7],o[7])
+\longrightarrow
+\operatorname{rank}.
+$$
 
-```sh
-./solver 21345671111111
-```
+There are
 
-Produces the optimal 11-move solution:
+$$
+7!\times3^6=3,674,160
+$$
+
+legal states, so the rank should cover exactly
+
+$$
+0\le\operatorname{rank}<3,674,160.
+$$
+
+#### Implementation Idea
+
+There are $7!=5040$ permutations. Lehmer encoding gives a permutation rank in
+
+$$
+P\in[0,5039].
+$$
+
+Each orientation digit is in $\{0,1,2\}$. Encoding the first six orientations in base 3 gives the orientation rank
+
+$$
+Q\in[0,728].
+$$
+
+The seventh orientation is determined by the orientation-sum invariant.
+
+The complete rank is
+
+$$
+\operatorname{rank}=729P+Q.
+$$
+
+> [!NOTE]
+> **Computing the permutation rank**
+>
+> Let $c_i$ be the number of elements to the right of position $i$ that are smaller than the element at position $i$.
+>
+> At position 0, after choosing the first element, the remaining six corners can be arranged in $6!$ ways. Increasing $c_0$ by one therefore skips an entire block of $6!$ permutations.
+>
+> Similarly:
+>
+> - $c_1$ has weight $5!$;
+> - $c_2$ has weight $4!$;
+> - …
+> - $c_5$ has weight $1!$;
+> - $c_6$ is necessarily zero.
+>
+> The Lehmer rank is therefore
+>
+> $$
+> P=\sum_{i=0}^{6}c_i(6-i)!.
+> $$
+
+The regular weights of $P$ and $Q$ allow both encodings to use Horner-style recurrences.
+
+Starting from $P=0$, process permutation positions $i=0,\ldots,6$:
+
+$$
+P\leftarrow P(7-i)+c_i.
+$$
+
+Starting from $Q=0$, process orientation positions $i=0,\ldots,5$:
+
+$$
+Q\leftarrow3Q+o_i.
+$$
+
+#### Proof of One-to-One Mapping and Range
 
 ```text
-B' R' D2 R' B R B' R D2 B R'
+permutation
+    ↓ Lehmer encoding
+unique P
+
+orientation
+    ↓ base-3 encoding, with the seventh twist determined by the invariant
+unique Q
+
+(P,Q)
+    ↓ 729P+Q
+unique rank
 ```
 
-That sample swaps two adjacent corners. A single transposition is an odd permutation, so it is unreachable on a physical 3×3×3 corner set without also disturbing the edges; on the 2×2×2 quotient it is a perfectly ordinary position, and it happens to be one of the hardest, sitting at distance 11.
+The combined rank can also be uniquely decomposed:
 
-### Input Validation
+$$
+P=\left\lfloor\frac{\operatorname{rank}}{729}\right\rfloor,
+$$
 
-Invalid input exits with status 2. `main` rejects anything that is not exactly one argument; `parse_state` rejects the rest:
+and
 
-- Out-of-bounds cubie digit (outside `1`–`7`) or orientation digit (outside `1`–`3`).
-- An argument that is not exactly 14 characters: a shorter one hits the terminating NUL inside the digit-range check, and a longer one fails the final `input[14] == '\0'` test.
-- Non-permutation input, caught by the duplicate scan inside `valid`.
-- Invalid orientation parity, $\sum_{i=1}^7 o_i = \sum_{i=1}^7 (d_i - 1) \not\equiv 0 \pmod 3$.
+$$
+Q=\operatorname{rank}\bmod729.
+$$
 
-| Status | Meaning |
-| :---: | :--- |
-| 0 | Solution printed, or self-test passed, and stdout was written successfully |
-| 1 | Self-test failure, the BFS diameter was not 11, the state table could not be built, or the output could not be written |
-| 2 | Usage or input validation error |
+Thus, two different pairs $(P,Q)$ cannot produce the same rank.
 
-Both output paths end in `output_failed`, which calls `fflush(stdout)` and then tests `ferror(stdout)`. The check belongs at the flush rather than at the call that produced the text. stdout is fully buffered when it is not a terminal, so a `puts` or `printf` that merely queues bytes into the buffer returns success even when the eventual write cannot happen, and the real error surfaces at the implicit flush after `main` returns, where nothing is left to observe it. Testing only the return value of `puts` misses every such failure: before this check existed, both programs exited 0 having written nothing when stdout was closed. `mini.c` performs the same flush test before returning.
+The maximum occurs at
 
-The usage message reads `argv[0]` through a guard, because C99 5.1.2.2.1 permits `argv[0]` to be a null pointer when `argc` is 0.
+$$
+P=5039,\qquad Q=728.
+$$
 
-## 6. Formal Verification and Testing
+Therefore,
 
-### Executable Self-Test
+$$
+\begin{aligned}
+\operatorname{rank}_{\max}
+&=729\cdot5039+728$
+&=3,674,159.
+\end{aligned}
+$$
 
-Running `./solver --self-test` conducts an exhaustive verification of the entire domain:
+The complete range is exactly
 
-1. Move inversion: for all 9 moves $m$, verifies that $m$ followed by $m^{-1}$ restores the exact solved state.
-2. Bijection invariant: loops through all $3{,}674{,}160$ ranks, where `unrank_state(rank, &t)` generates a state, `valid(&t)` must hold, and `rank_state(&t)` must return the original rank.
-3. Graph exploration: builds the complete BFS table, verifying that exactly $3{,}674{,}160$ unique states are visited and that the computed graph diameter equals 11.
+$$
+\boxed{0\le\operatorname{rank}\le3,674,159}.
+$$
+
+This one-to-one correspondence applies to legal states satisfying the orientation-sum invariant.
+
+## 2.2 Baseline Memory Cost
+
+### Conclusion
+
+The baseline makes queries inexpensive by precomputing a next move for the entire state space. However, this memory-for-query-time trade-off exceeds the target's 128 KiB budget.
+
+### Explanation
+
+Consider two cases:
+
+- the original baseline implementation;
+- a hypothetical precomputed-table variant, where the move table is generated in advance and no BFS queue is needed during target execution.
+
+> [!NOTE]
+> **Memory calculation**
+>
+> State-space size:
+>
+> $$
+> N=3,674,160.
+> $$
+>
+> A move-table entry must represent nine moves and an unvisited marker, so one byte is sufficient.
+>
+> The implementation stores each queue rank as a 32-bit integer:
+>
+> $$
+> \operatorname{rank}_{\max}=3,674,159<2^{32},
+> $$
+>
+> giving four bytes per queue entry.
+>
+> Therefore,
+>
+> $$
+> \text{move-table size}=3,674,160\times1=3,674,160\text{ bytes},
+> $$
+>
+> $$
+> \text{BFS queue size}=3,674,160\times4=14,696,640\text{ bytes}.
+> $$
+
+| Data              | Purpose                                                     |         Size |
+| ----------------- | ----------------------------------------------------------- | -----------: |
+| Move table        | Next move toward solved for every state, one byte per state |  3,674,160 B |
+| BFS queue         | Space for every state's 32-bit rank                         | 14,696,640 B |
+| Transition tables | P/Q quarter-turn transitions for R, B, and D                |     34,614 B |
+
+#### Original Baseline Implementation
+
+The sum of these three dominant allocations is
+
+$$
+3,674,160+14,696,640+34,614
+=18,405,414\text{ bytes}
+\approx17.55\text{ MiB}.
+$$
+
+#### Hypothetical Precomputed-Table Variant
+
+Even the retained move table alone requires
+
+$$
+3,674,160\text{ bytes}\approx3,588.05\text{ KiB}.
+$$
+
+This excludes any additional query state, constants, or other runtime storage.
+
+> [!IMPORTANT]
+> Both cases exceed the target memory limit of **128 KiB**.
+>
+> The problem is not merely that the queue is too large: retaining a complete state table is itself unsuitable for the target.
+
+# 3. Stage 2 — Compact Representation and Search
+
+## 3.1 Factored Coordinates
+
+### Conclusion
+
+Storing and manipulating complete state structures for every transition is expensive. Instead, the solver can operate on compact ranks and obtain the next rank through `transition[face][rank]` lookups.
+
+Factoring the permutation and orientation coordinates is what makes these transition tables small enough for the target.
+
+### Explanation
+
+> [!NOTE]
+> P and Q evolve independently under a face turn, so their transitions can be stored in two separate tables, reducing the coordinate-table domain from
+>
+> $$
+> 5040\times729
+> \quad\text{to}\quad
+> 5040+729.
+> $$
+>
+> Only quarter-turn tables for the three faces are stored. Two or three consecutive lookups produce a half turn or inverse turn, so separate tables for all nine HTM moves are unnecessary.
+
+There are three basic quarter-turn faces: `R`, `B`, and `D`.
+
+The largest permutation coordinate is 5,039, and the largest orientation coordinate is 728. Both exceed the 8-bit maximum of 255, but both fit within 16 bits. Each transition entry can therefore use a two-byte unsigned integer.
+
+| Table                   |    Calculation |      Bytes |
+| ----------------------- | -------------: | ---------: |
+| Permutation transitions | `3 × 5040 × 2` |     30,240 |
+| Orientation transitions |  `3 × 729 × 2` |      4,374 |
+| **Total**               |                | **34,614** |
+
+> [!IMPORTANT]
+> The transition tables require **34,614 bytes, approximately 33.80 KiB**, which is below the target's **128 KiB** static-data budget.
+>
+> This accounts for the transition tables only; heuristic tables and the remaining program data must also fit within the same budget.
+
+## 3.2 Pattern Database
+
+### Conclusion
+
+The target does not store all 3,674,160 states. Instead, a smaller Pattern Database (PDB) is built on the host.
+
+A PDB intentionally ignores part of the state information and keeps only the information needed by the abstraction, greatly reducing the number of states. The host computes the shortest distance from each abstract state to the solved state, and these distances are then used as heuristic lower bounds during target-side search.
+
+For the $i$-th abstraction:
+
+$$
+d_i(\pi_i(s))\le d(s).
+$$
+
+Therefore, when multiple PDBs are available, the heuristic can use:
+
+$$
+h(s)=\max_i d_i(\pi_i(s)),
+$$
+
+while still satisfying:
+
+$$
+h(s)\le d(s).
+$$
+
+Thus, the heuristic never overestimates the true distance and is admissible.
+
+### Explanation
+
+The current PDB keeps the complete orientation coordinate $Q$, but only partial information from permutation coordinate $P$: the positions occupied by three tracked cubies, without preserving their exact identity ordering.
+
+Therefore, the original state:
 
 ```text
-3674160 states; diameter 11
+(P, Q)
 ```
 
-The three steps cover different things, and step 1 carries more weight than its two lines suggest. Because `inverse_move` pairs a turn of $t$ quarter turns with one of $4 - t$, the check applies exactly four quarter turns of each face and requires the solved state back. That holds only if every `source` row is a permutation whose order divides 4 and every `twist` row cancels over four applications, which is a real constraint on the cube model and not a restatement of the tables. Step 2 is what rules out an invalid state slipping into the encoding: it unranks, validates, and re-ranks all 3,674,160 indices. Step 3 establishes connectivity, that the 9 generators reach every encoded state from solved, so no valid state is left unsolvable, and it pins the diameter. None of the three steps checks that a stored move is one level closer to solved; that property comes from the FIFO order of the search, as argued in section 4, and is not verified mechanically anywhere.
+is abstracted into:
 
-### Deductive Verification with Frama-C
-
-The `make prove` target executes deductive verification with Frama-C 33.0 (Arsenic) using the WP (weakest precondition) plugin with RTE (runtime error annotation) and the Alt-Ergo SMT solver:
-
-```sh
-frama-c -wp -wp-fct quarter_turn,rank_state,valid,parse_state \
-  -wp-rte -rte-verbose 0 -wp-prover alt-ergo -wp-timeout 20 \
-  -wp-cache none solver.c
+```text
+positions of three tracked cubies
++
+complete Q
 ```
 
-Frama-C proves all 164 generated goals for `quarter_turn`, `rank_state`, `valid`, and `parse_state`: 102 directly with Qed and 56 with Alt-Ergo 2.6.3, plus three termination and three unreachable-path goals. The contracts establish quarter-turn semantics, ranking bounds, exact state validation, and the exact mapping from a successful 14-digit parse to a valid state, together with their runtime-error obligations. A fresh, uncached run reports 164/164 valid goals with no timeout or failed goal, in roughly 8 s wall clock on an idle development machine with the toolchain warm. The duration is machine dependent and strongly load sensitive: readings taken during a parallel build ran past 18 s for the same 164 goals. Elapsed time is not stable enough to gate on; the proved-equals-generated identity is, which is what `make prove` actually asserts.
+Choosing three occupied positions from seven gives:
 
-Only functions with meaningful behavioral postconditions are selected. `apply_move` previously contributed runtime-safety and termination goals but had no postcondition, so counting it as deductive coverage overstated what was proved; move inversion remains checked by the executable self-test. `unrank_state`, `build_table`, and `main` sit outside the verification target, so the ACSL contract `unrank_state` already carries is neither proved nor consumed by any verified caller. That gap stays open because proving the full ranking bijection and BFS completeness requires substantially larger mathematical invariants, while the exhaustive executable check covers every rank and the complete graph.
+$$
+\binom{7}{3}=35
+$$
 
-What the proof does not say is as important as what it does. WP establishes that these four functions are arithmetic-overflow free, terminating, free of out-of-bounds access and invalid dereference, and faithful to their contracts for every input satisfying their preconditions. Memory safety holds modulo the two RTE categories Frama-C 33 cannot express, described below; neither bites here, since none of these functions makes an indirect call or depends on pointer alignment. It says nothing about the cube model itself. That `source` and `twist` describe real face turns rests on two checks that cover different failures, and neither is redundant. The 9 generators reach exactly 3,674,160 states at a half-turn-metric diameter of exactly 11, the published group order and God's number for this puzzle; and move inversion requires four quarter turns of each face to be the identity. The second is not implied by the first, which is easy to demonstrate: replacing the `R` row of `source` with the 3-cycle `{1, 2, 0, 3, 4, 5, 6}` and deleting the move-inversion loop still prints `3674160 states; diameter 11` and exits 0, because the mutated generators still reach the whole space, yet the resulting binary never terminates on a real query, emitting `R'` forever, since a 3-cycle applied three times is the identity and the solve loop never advances. With the loop present that mutation is rejected, as is a `twist` row of `{1, 1, 1, 0, 0, 0, 0}` whose entries do sum to 0 mod 3. A one-row typo therefore reaches past the state count and the diameter, and move inversion is what stops it. That the table yields shortest paths rests on the standard FIFO argument for unit-weight BFS plus the check that all 3,674,160 states were reached; `build_table` is outside both the WP target and any independent exhaustive check of its output.
+possible position subsets.
 
-Frama-C 33 reports its unsupported alignment and indirect-call RTE categories as warnings even though these functions make no indirect calls and all generated obligations are proved. `make prove` filters exactly those two known capability messages, leaving every other warning visible. It requires a nonzero proof summary whose proved and generated counts match, and rejects any Timeout, Unknown, or Failed count, because WP itself may exit successfully after an incomplete proof. This avoids treating a harmless change in goal count as a regression. `-rte-verbose 0` removes progress chatter only.
+Combining them with:
 
-## 7. Implementation Notes and Possible Improvements
+$$
+729
+$$
 
-The current code is correct and fast enough; the following are the changes that would actually pay for themselves, roughly in order of value.
+possible orientation coordinates gives:
 
-1. Drop the queue and sweep the table by level. The 14.016 MiB `queue` is 79.8% of peak memory and exists only to name the current frontier. Since the depth of a state never exceeds 11 and a move number never exceeds 8, both fit in a nibble: store `depth << 4 | move` in the existing byte, keep `0xFF` as the unvisited marker, and expand level $d$ by scanning the table for entries whose high nibble is $d$. Peak memory drops from 17.553 MiB to 3.537 MiB computed, or from 18.89 MiB to roughly 4.87 MiB measured, which brings the search peak within 34 KiB of the 3.504 MiB retained footprint; the remaining gap is the transition tables, which are still live during the search and only disappear if they are eliminated too. The sweep also replaces `tail`, so it has to keep a running count of discovered states for the completeness check `build_table` performs today. The cost is one expanding pass per level, $d = 0 \dots 11$, the last of which finds a non-empty frontier of 2,644 states and discovers nothing new, so 12 linear passes over 3.5 MiB, about 44 million sequential byte comparisons, against the 33 million random-access expansions the search already performs. The solve loop then reads the move as `table[rank] & 0x0F`, and the per-level histogram in section 4 becomes a by-product of the run instead of an external claim.
+$$
+35\times729=25,515
+$$
 
-2. Harden the solve loop. `for (uint32_t rank = rank_state(&state); rank; rank = rank_state(&state))` trusts the table completely. A byte above 8 indexes `move_names` and, through `apply_move`, `source` out of bounds, and even a well-formed byte could in principle cycle forever. Checking `move < MOVES` before either lookup and bounding the loop at 11 iterations costs one comparison and one counter, and turns two invariants that currently hold by construction into runtime checks.
+abstract states per PDB, which is much smaller than the full 3,674,160-state space.
 
-3. Report why the table could not be built. `build_table` returns `NULL` both when `malloc` fails and when the search fails to reach all 3,674,160 states, and `main` prints a single message for both. These are a resource failure and a logic failure; separating them costs an out-parameter and makes a future regression diagnosable.
+Because an abstract state ignores part of the original information, the abstract problem can only be easier, not harder. For example, if the complete cube requires at least 7 moves to solve, the abstract problem may require only 4 or 5 moves, but it should never require more than 7.
 
-4. Move the transition tables off the stack. `permutation` and `orientation` occupy 33.8 KiB of automatic storage. That is unremarkable on a hosted platform with an 8 MiB main-thread stack, but it exceeds the default stack of some embedded and thread configurations. Allocating them on the heap, or making them `static` if the one-time 33.8 KiB of resident data is acceptable, removes the constraint.
+Therefore:
 
-5. Extend the proof to `unrank_state` incrementally. The full bijection, `rank_state(unrank_state(r)) == r`, needs a factoradic invariant out of proportion to this program. A useful intermediate is `ensures valid_state(state)`. Its orientation half is easy, since the six base-3 digits are below 3 by construction and the seventh is built from the sum. Its permutation half is the real work: the loop needs an invariant saying that the first `i` entries are distinct, that `available[0..CUBIES-i-1]` still holds exactly the unused cubies, and that `f == (6 - i)!` with `p < f * (CUBIES - i)`, which is what bounds the factoradic digit `q = p / f` below `CUBIES - i` and keeps the index into `available` in range. That postcondition alone does not yet discharge the `rank_state` calls in `build_table`, because those run on `quarter_turn(state, face)`; closing the gap also needs a lemma that each row of `source` is a permutation, so a quarter turn preserves distinctness. Both steps are far smaller than the bijection, but they only pay off once `build_table` also enters the `-wp-fct` list, since WP generates call-site obligations only for the functions it analyzes. That much is attainable without proving BFS completeness: `build_table` would need loop invariants strong enough to bound its ranks and array indices, nothing about which states are reached.
+$$
+d_i(\pi_i(s))\le d(s).
+$$
 
-Two changes that look attractive and are not worth making: tracking the rank incrementally in the solve loop with the same factored tables, which would remove a handful of `rank_state` calls from a loop that runs at most 11 times; and replacing the table with a meet-in-the-middle search, which would answer a single query in well under a millisecond against the 0.065 s the table costs. The speed argument for keeping the table is weak, since nothing here queries more than once per process, and the constant-time lookup buys a library entry point that does not exist. The real argument is that the table is the verification artifact. Building it exhaustively is what establishes that the 9 generators reach exactly 3,674,160 states at diameter 11, which is the only evidence that `source` and `twist` model a real cube at all, as section 6 discusses. A meet-in-the-middle search would answer faster and prove nothing, and the 0.065 s is the price of a program that checks its own model on every run.
+If several PDBs return:
 
-## References
+```text
+3, 5, 4, 6
+```
 
-1. Philo Li, [“How to Solve a Rubik’s Cube Without Memorizing Algorithms”](https://philoli.com/zh/blog/solve-rubiks-cube-without-formulas/), 2026.
-2. Gene Cooperman and Larry Finkelstein, “New Methods for Using Cayley Graphs in Interconnection Networks,” *Discrete Applied Mathematics* 37–38 (1992), 95–118.
-3. Antti Valmari, “What the Small Rubik’s Cube Taught Me about Data Structures, Information Theory, and Randomisation,” *International Journal on Software Tools for Technology Transfer* 8(3) (2006), 180–194.
+the heuristic uses the maximum:
+
+$$
+h(s)=6.
+$$
+
+Since none of the individual values overestimates the true distance, their maximum is also safe and provides a stronger lower bound.
+
+The distances from multiple PDBs cannot be added directly because the same move may improve several abstractions at the same time. Adding them could count the effect of one move multiple times and cause the heuristic to overestimate. Therefore, the current implementation uses `max()` instead of summation.
+
+## 3.3 Non-recursive IDA*
+
+### Conclusion
+
+The PDB from the previous section provides an admissible heuristic $h(s)$, representing a lower bound on the number of remaining moves needed to solve the current state.
+
+The target uses non-recursive IDA* and only explores branches satisfying:
+
+$$
+g+h\le B,
+$$
+
+where:
+
+- $g$: the number of HTM moves already taken;
+- $h$: the heuristic lower bound;
+- $B$: the current maximum allowed solution length.
+
+The search starts from:
+
+$$
+B=h(start).
+$$
+
+If no solution is found under the current bound, $B$ is increased by one and the search restarts:
+
+```text
+B = h(start)
+
+search all branches with g + h <= B
+
+if no solution is found:
+    B = B + 1
+    search again
+```
+
+The closer the heuristic is to the true remaining distance, the earlier impossible branches can be pruned, reducing the number of nodes that must actually be expanded.
+
+### Non-recursive Search
+
+A normal DFS uses recursive function calls to preserve the search state at each depth. The target instead uses a fixed-size array of explicit frames.
+
+Each frame stores the information required at the current depth, such as:
+
+```text
+P
+Q
+previous face
+next move to try
+```
+
+When the search descends, a new frame is added. When a branch is exhausted, the search returns to the previous frame.
+
+The search therefore still behaves as DFS, but does not depend on the recursive call stack.
+
+Because the HTM diameter is known to be 11, only depths 0 through 11 must be represented, so a fixed array of 12 search frames is sufficient.
+
+### Optimality
+
+Assume the true shortest distance is $d$.
+
+When:
+
+$$
+B<d,
+$$
+
+no solution of length at most $B$ exists, so the search cannot find a shorter solution prematurely.
+
+When:
+
+$$
+B=d,
+$$
+
+consider any node on an optimal path. If $g$ moves have already been taken, the true remaining distance is:
+
+$$
+d-g.
+$$
+
+Because the PDB heuristic never overestimates:
+
+$$
+h\le d-g.
+$$
+
+Therefore:
+
+$$
+g+h\le d.
+$$
+
+Thus, an optimal path will not be pruned by the heuristic. As long as the bounded DFS completely explores the remaining legal branches, an optimal solution must be found when $B=d$.
+
+Therefore, the first solution found by IDA* has length:
+
+$$
+d.
+$$
+
+This is why IDA* can reduce the search space while still preserving the shortest-solution guarantee.
+
+The actual solved state is still checked directly using:
+
+```text
+P == 0 && Q == 0
+```
+
+The solver cannot rely only on `h == 0`, because the PDB represents an abstract state. An abstract state with heuristic value zero does not necessarily imply that the complete cube is solved.
+
+### Same-face Pruning
+
+A shortest solution never needs two consecutive moves on the same face.
+
+For example:
+
+$$
+R\cdot R=R^2,
+$$
+
+so two moves can be replaced by one. Similarly:
+
+$$
+R\cdot R'=I,
+$$
+
+so the two moves cancel completely.
+
+Therefore, if the previous move used face `R`, the next depth does not need to consider:
+
+```text
+R
+R2
+R'
+```
+
+The same rule applies to `B` and `D`.
+
+The root initially has 9 HTM moves available. At later depths, excluding the previous face leaves only 6 candidate moves.
+
+This pruning does not remove any shortest solution, but significantly reduces the branching factor.
+
+## 3.4 C Correctness and Validation
+
+### Practical Validation
+
+The C implementation uses the baseline BFS as an exact oracle to verify that the new IDA* solver actually finds shortest solutions.
+
+The validation flow is:
+
+> [!Note]
+> input state
+> ↓
+> IDA* search
+> ↓
+> solution path
+> ↓
+> replay solution
+> ↓
+> compare with BFS exact distance
+
+Both of the following conditions must hold:
+
+```text
+replay(solution) == solved
+solution length == exact BFS distance
+```
+
+A successful replay only proves that the solution is valid. The solution can be confirmed as shortest only when its length is equal to the BFS oracle distance.
+
+The solver provides:
+
+```bash
+./solver --self-test
+```
+
+This command performs the following checks:
+
+> [!Note]
+> validate state / rank representation
+> ↓
+> check P/Q transitions against cubie-level moves
+> ↓
+> build the complete BFS oracle and confirm diameter = 11
+> ↓
+> check the mixed PDB and packed lookup
+> ↓
+> verify that the heuristic does not overestimate
+> for all 3,674,160 states
+> ↓
+> test IDA* on multiple states:
+> solution length == BFS distance
+> and replay reaches solved
+
+The IDA* part of `--self-test` does not run IDA* on all 3,674,160 states. It tests all states at distances 0–2, the existing test vectors, and deterministically sampled states at fixed rank intervals.
+
+To verify all 2,644 distance-11 hardest states, the solver also provides:
+
+```bash
+./solver --search-test 0 2644
+```
+
+To verify IDA* against the BFS oracle over an arbitrary rank interval:
+
+```bash
+./solver --verify-range FIRST COUNT
+```
+
+Both modes check the solution length and replay correctness.
+
+---
+
+## 3.5 Query-table Memory Layout
+
+The target no longer stores a complete solution table for all 3,674,160 states. It keeps only the compact tables required during search.
+
+| Data                    |       Calculation |      Bytes |
+| ----------------------- | ----------------: | ---------: |
+| Permutation transitions |    `3 × 5040 × 2` |     30,240 |
+| Orientation transitions |     `3 × 729 × 2` |      4,374 |
+| Permutation distance    |        `5040 × 1` |      5,040 |
+| Orientation distance    |         `729 × 1` |        729 |
+| Permutation subset      |        `5040 × 1` |      5,040 |
+| Packed mixed PDB        | `ceil(25515 / 2)` |     12,758 |
+| **Total table payload** |               sum | **58,181** |
+
+The first four values are obtained directly from the number of table entries multiplied by the width of each entry.
+
+The mixed PDB contains:
+
+$$
+\binom{7}{3}\times729=25,515
+$$
+
+entries.
+
+Each distance uses 4 bits, so two entries can share one byte:
+
+$$
+\left\lceil\frac{25,515}{2}\right\rceil
+=12,758\text{ bytes}.
+$$
+
+The six tables therefore require a total payload of **58,181 bytes**.
+
+This 58,181-byte query-table payload is the persistent table cost used by the target solver. The complete linked memory footprint is evaluated later after the full RV32I solver has been integrated.
+
+# 4. Stage 3 — Handwritten RV32I Implementation
+
+This section focuses on how the C data and control flow are implemented in RV32I: which registers carry arguments, how data is addressed, and how search state is preserved across function calls.
+
+`_start` first initializes the stack with `la sp, __stack_top`, then calls the following functions in sequence.
+
+| Function           | Input registers                        | Return values                                       |
+| ------------------ | -------------------------------------- | --------------------------------------------------- |
+| `cube_parse_state` | `a0=input`, `a1=state buffer`          | `a0=0` on success, `2` for invalid input            |
+| `cube_rank_state`  | `a0=state buffer`                      | `a0=P`, `a1=Q`                                      |
+| `cube_heuristic`   | `a0=P`, `a1=Q`                         | `a0=h`; preserves `a1`                              |
+| `cube_apply_move`  | `a0=P`, `a1=Q`, `a2=move`              | `a0=P'`, `a1=Q'`                                    |
+| `cube_solve`       | `a0=P`, `a1=Q`, `a2=path buffer`       | `a0=length`, or `-1` on failure                     |
+| `cube_replay`      | `a0=P`, `a1=Q`, `a2=path`, `a3=length` | `a0=status`, `a1=final P`, `a2=final Q`, `a3=count` |
+
+The parser, ranking, heuristic, and move routines are leaf functions: they do not call other functions and therefore require no additional stack frames.
+
+## 4.1 Input Parsing and Validation
+
+`cube_input` is a string embedded in the assembly image. The parser writes directly to `cube_state`: offsets `0..6` hold the permutation and offsets `7..13` hold the orientations, both converted to zero-based bytes.
+
+| Register    | Role in the parser                                           |
+| ----------- | ------------------------------------------------------------ |
+| `t0` / `t1` | Input / output cursors                                       |
+| `t2`        | Number of characters remaining                               |
+| `t3`        | Permutation `seen` mask, then reused for the orientation sum |
+| `t4..t6`    | Temporaries for characters, range limits, and bit masks      |
+
+Characters are read with `lbu`, without sign extension. Range checking subtracts the ASCII value of `'1'` and then uses an unsigned comparison:
+
+```asm
+lbu  t4, 0(t0)
+addi t4, t4, -49
+li   t5, 7
+bgeu t4, t5, .Linvalid
+```
+
+A character below `'1'` becomes a large value when interpreted as unsigned after subtraction. Thus, this single upper-bound check rejects values that are too low, too high, or NUL. The orientation parser uses the same method with a limit of 3.
+
+The parser computes `1 << digit` only after the range check. If the corresponding bit is already set, the cubie is a duplicate and the input is rejected. Seven distinct values within the valid range necessarily form a complete permutation.
+
+The parser does not call `strlen`: short strings are rejected when the range check encounters NUL, and after reading fourteen characters the parser explicitly requires `input[14] == 0`. The orientation sum is at most 14, so a short loop repeatedly subtracts 3 to check the remainder, without `div` or `rem`.
+
+The function clobbers only `a0` and `t0..t6`, preserving `sp`, `ra`, and the `s*` registers. On failure, the output buffer may be partially written, but `_start` checks the status before using it.
+
+## 4.2 P/Q Ranking
+
+`cube_rank_state` receives a validated state pointer. Register `t0` holds the buffer base, `t1` accumulates P, `t2` is the position index, and `t4` counts smaller elements. Across the seven positions, the function performs 21 comparisons with elements to the right.
+
+The factors in the Horner recurrence are `7..1`. Since RV32I has no `mul`, this baseline uses repeated addition: **the old P is copied to `a2` before `t1` is cleared**, or the multiplicand would be lost. The seven iterations perform 28 additions for multiplication, followed by additions of the smaller-element counts.
+
+After computing P, the routine advances the buffer base by 7 and reads the first six orientation bytes. Register `a1` directly accumulates Q:
+
+```asm
+slli t4, a1, 1    # 2Q
+add  a1, t4, a1   # 3Q
+add  a1, a1, t3   # 3Q + digit
+```
+
+This uses the identity
+
+$$
+3Q=2Q+Q.
+$$
+
+Therefore, one shift and one addition implement the multiplication in `Q = 3Q + digit`. Finally, the function copies P to `a0` and returns P and Q in two registers. There is no need to construct a C struct or divide `729P + Q` to recover the coordinates.
+
+`_start` stores the root P/Q in its own `s3/s4` and checks `P < 5040` and `Q < 729`. Ranking is performed only once at query entry. Search children are generated directly from transition tables rather than ranked again.
+
+## 4.3 Heuristic Lookup
+
+The heuristic uses three distance tables:
+
+$$
+h(P,Q)=\max(d_P[P],d_Q[Q],d_M[\text{mixed index}]).
+$$
+
+Here:
+
+- $d_P[P]$ is the shortest distance considering permutation only.
+- $d_Q[Q]$ is the shortest distance considering orientation only.
+- $d_M$ considers the positions of selected cubies together with the full orientation coordinate.
+
+`cube_heuristic` receives `a0=P` and `a1=Q`. The `dP`, `dQ`, and subset tables contain byte entries, so each address is simply `base + index` and is read with `lbu`. Unlike transition-table entries, these indices do not need to be multiplied by two.
+
+`t1` holds the larger of dP and dQ, while `t3` receives the subset index. The mixed index is `729 * subset + Q`. This baseline computes it by repeatedly adding 729, skipping the loop when `subset = 0`. Because this calculation lies on the hot lookup path, it contributes to the performance difference discussed in Section 6.5.
+
+The packed accessor first records the low bit of the index, then shifts the index right by one to obtain the byte offset. An even index requires a shift of 0; an odd index requires a shift of 4:
+
+```asm
+lbu  t3, 0(t6)
+srl  t3, t3, t5
+andi t3, t3, 15
+```
+
+`t6` points to the selected byte, and `t5` contains the nibble shift. Masking with 15 retains only four bits. The extracted distance is compared with `t1`, and the final heuristic value is returned in `a0`.
+
+This leaf function preserves `a1` but clobbers `a0` and temporary registers. Callers cannot leave a child P in `a0` and expect it to survive the call.
+
+## 4.4 Explicit-frame IDA*
+
+`cube_solve` must preserve search state across calls to `cube_apply_move` and `cube_heuristic`, so it uses saved registers. The following assignments apply only inside the search routine:
+
+| Registers   | Purpose                                           |
+| ----------- | ------------------------------------------------- |
+| `s0` / `s1` | Bound / depth                                     |
+| `s2` / `s3` | Frame-array base / path pointer                   |
+| `s4/s5`     | Root P/Q, retained when restarting at a new bound |
+| `s6/s7`     | Child P/Q                                         |
+| `s8` / `s9` | Move index / face                                 |
+| `s10`       | Current-frame pointer                             |
+
+The routine reserves a single 64-byte stack frame to save `ra` and `s0..s10`. Each `jal` updates `ra`, so the return address must be saved first. The registers and `sp` are restored before returning. The stack remains 16-byte aligned; this is one fixed ABI frame, not a separate push for every search depth.
+
+Search-depth data is stored separately in `.bss` as twelve six-byte frames:
+
+| Offset | Field         | Size |
+| -----: | ------------- | ---: |
+|      0 | P             |  2 B |
+|      2 | Q             |  2 B |
+|      4 | Previous face |  1 B |
+|      5 | Next move     |  1 B |
+
+The frame-array base is two-byte aligned. The six-byte stride and P/Q offsets of 0 and 2 preserve halfword alignment. Coordinates use `lhu/sh`; face, cursor, and path bytes use `lbu/sb`. The baseline locates a frame at `base + 6 * depth` by repeatedly adding 6.
+
+Move indices `0..8` are decoded into face and quarter-turn count by subtracting 3 at most twice, without `/3` or `%3`. P/Q transition tables are face-major, with row strides of **10,080 B** and **1,458 B**, respectively. After selecting the row, `slli index, 1` produces the halfword byte offset, and `lhu` retrieves the next coordinate.
+
+The child P/Q must be saved before looking up its heuristic:
+
+```asm
+jal ra, cube_apply_move
+mv  s6, a0
+mv  s7, a1
+jal ra, cube_heuristic
+```
+
+Because `a0` then holds h, the next child frame is written from `s6/s7`. The path byte at `path[depth]` and the next frame are written only after the child passes the cutoff test. The parent's next-move cursor was already incremented, so backtracking only needs to decrease `depth` and reload the parent frame.
+
+The root frame sets its previous-face byte to 3. The goal check tests whether `P | Q` is zero and runs before the depth-limit check. Both the ordering of these conditions and the position of the cursor update directly affect the assembly control flow.
+
+## 4.5 Replay and Output
+
+`cube_replay` receives the original P/Q, the path pointer, and the path length. In CLI mode, it uses a 16-byte stack frame to preserve the cursor, length, applied-move count, and `ra`. Each move is range-checked before `cube_apply_move` is called.
+
+The entry routine stores the returned final P/Q and applied count in `s9/s10/s11`. It requires final P/Q to equal zero and the applied count to equal the solution length before producing output. In GUI mode, the replay stack frame grows to 32 B to preserve P/Q across renderer calls that may clobber `a0/a1`.
+
+Each entry in the output token table occupies four bytes, such as `R'\0\0`. Consequently, `move << 2` locates the corresponding string without multiplication or a separate pointer table.
+
+Ripes provides environment calls: `a7=4` prints the string pointed to by `a0`, and `a7=93` exits with the status in `a0`. The routine prints a space before every token after the first, and always ends with a newline. An empty solution prints only a newline.
+
+In this pinned ISS build, the instruction after the exit ecall is also retired. Therefore, a self-loop follows the exit to prevent execution from falling through into the next function:
+
+```asm
+li a7, 93
+ecall
+
+.Lhalt:
+    j .Lhalt
+```
+
+Invalid inputs return status 2, internal verification failures return 1, and successful queries return 0. The CLI print-string service also emits a NUL terminator and a simulator exit notice. The checker retains the raw output, verifies the exit status separately, and then compares the complete move line.
+
+# 5. RV32I Correctness Validation
+
+The host oracle from Section 3.4 is retained as a reference. This section additionally checks assembly argument passing, register and memory operations, and actual execution in Ripes:
+
+| Gate | Validation                                                                                            |
+| ---- | ----------------------------------------------------------------------------------------------------- |
+| H1   | $h(s) \le d(s)$ over all 3,674,160 states                                                             |
+| H2   | Population, maximum values, solved entries, and transition bijections for all dependent tables        |
+| H3   | Search length equals the exact distance for every state, and the path replays to solved               |
+| H4   | Every packed mixed-table entry equals its unpacked reference                                          |
+| T5   | Target replay and independent host cubie replay of returned paths, including all 2,644 hardest states |
+| T6   | `21345671111111` returns an optimal 11-move solution                                                  |
+| T7   | Solved, one R move, and the specified distance-11 case reproduced on both ISS and RV32_5S             |
+
+H3 uses 57 contiguous rank ranges to cover `[0,3674160)` completely, without sampling or skipping states.
+
+Separate target checks isolate potential implementation errors:
+
+| Check                   | Coverage and purpose                                                                                                                                              |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Parser / complete entry | 122 cases: 27 valid and 95 invalid, covering short/long strings, duplicates, digit and high-byte boundaries at every position, orientation sums, and NUL handling |
+| Ranking kernel          | 5,768 records covering all 5,040 P values and 729 Q values; verifies `a0/a1` returns and complete traversal                                                       |
+| Heuristic kernel        | 30,555 calls, including all 25,515 mixed entries; verifies byte addressing and even/odd nibble selection                                                          |
+| Replay-only kernel      | 12 cases covering incorrect paths, invalid moves/lengths/coordinates, and saved-register canaries                                                                 |
+| Instruction audit       | Decodes 451 machine words in linked `.text` and confirms that all use uncompressed base RV32I instructions                                                        |
+
+For each complete query, the checker verifies more than the simulator's host process exit code. It checks guest status, parsed-byte fingerprints, P/Q, h, path length, stack pointer, final P/Q, applied-move count, and complete output. Successful simulator process termination does not imply that the guest solved the cube correctly.
+
+Host replay updates the cubie model through its source/twist operations without reading the target's transition tables, reducing the risk of both implementations sharing the same error. The ranking and heuristic domain tests do not claim that the target searched all 3,674,160 combined states; full-domain optimality is established by H3.
+
+Negative controls confirm that the checker rejects faults: it detects both a modified replay result that falsely reports success before reaching solved and a modified output token changing `R'` to `X'`. Section 7 also includes a renderer palette-corruption test.
+
+# 6. Memory and Performance Evaluation
+
+The following measurements use the **final renderer-off ELF**. Static data is checked against the actual linked section sizes:
+
+```bash
+llvm-readelf -h -S -s -A build-rv32i/smoke.debug.elf
+```
+
+The main sections are:
+
+```text
+.text    Address 00001000  Size 00070c
+.rodata  Address 00001710  Size 00e3b2
+.bss     Address 0000fad0  Size 000468
+```
+
+## 6.1 `.rodata`
+
+`.rodata` contains error messages, move tokens, six query tables, and the input.
+
+| Query table            |      Bytes |
+| ---------------------- | ---------: |
+| Permutation turns      |     30,240 |
+| Orientation turns      |      4,374 |
+| Permutation distances  |      5,040 |
+| Orientation distances  |        729 |
+| P-to-subset projection |      5,040 |
+| Packed mixed distances |     12,758 |
+| **Total**              | **58,181** |
+
+The first table and the input appear in the symbol table as:
+
+```text
+0000176e 30240 OBJECT cube_permutation_turn
+0000fab3    15 OBJECT cube_input
+```
+
+Their address difference is:
+
+$$
+0xfab3-0x176e=0xe345=58,181\text{ B},
+$$
+
+matching the sum of the six tables.
+
+The data preceding the tables extends from the start of `.rodata` at `0x1710` to `0x176e`:
+
+$$
+0x176e-0x1710=94\text{ B}.
+$$
+
+The two error messages occupy $20+34=54$ B. The nine move tokens, space, and newline occupy $36+2+2=40$ B. These sizes include the necessary `\0` terminators.
+
+The input occupies 15 B: fourteen characters and a terminating `\0`. Therefore:
+
+$$
+\text{.rodata}=94+58,181+15=\boxed{58,290\text{ B}}.
+$$
+
+## 6.2 `.bss`
+
+The final layout is shown below. End addresses are exclusive:
+
+| Item                    | Start → End       | Bytes |
+| ----------------------- | ----------------- | ----: |
+| `cube_state`            | `0xfad0 → 0xfade` |    14 |
+| `cube_path`             | `0xfade → 0xfae9` |    11 |
+| Stack alignment padding | `0xfae9 → 0xfaf0` |     7 |
+| Stack reserve           | `0xfaf0 → 0xfef0` | 1,024 |
+| `cube_frames`           | `0xfef0 → 0xff38` |    72 |
+
+The stack grows toward lower addresses. Thus, `__stack_top` and `cube_frames` both being located at `0xfef0` does not mean the two regions overlap.
+
+$$
+\text{.bss}=14+11+7+1,024+72=\boxed{1,128\text{ B}}.
+$$
+
+The search routine's 64-byte ABI frame and the replay routine's 16-byte frame use the existing stack reserve. They must not be counted again as additional static data.
+
+## 6.3 Static Data and the Limit
+
+This ELF has no `.data` section, so its size is zero:
+
+$$
+\text{static data}=58,290+0+1,128=\boxed{59,418\text{ B}}.
+$$
+
+The 128 KiB limit equals 131,072 B, leaving 71,654 B unused. The image therefore meets the limit. `.text` occupies 1,804 B and is reported separately; it is not included in this assignment's static-data budget.
+
+`.symtab`, `.strtab`, and `.riscv.attributes` are analysis metadata rather than part of the static data above. Actual Ripes runs use the stripped `smoke.elf`, while symbol inspection uses `smoke.debug.elf`.
+
+## 6.4 Complete Hardest-state Performance
+
+Measurements use `/usr/bin/ripes`, package `ripes-git 2.2.6.r108.g0b4c65b-1`, Build ID `1b3e4f66c547c43ca72e2253150dbd67bdad1821`, processor `RV32_ISS`, and no extensions.
+
+The `--iret` count covers the complete path through parsing, ranking, search, replay, output, and termination. The renderer is compiled out.
+
+### Measurement and Evidence Collection
+
+Exact BFS first enumerates the entire state space and exports **2,644 unique distance-11 inputs in ascending rank order**. The collector checks the complete histogram, each input's validity and dense rank, and the inclusion of the specified vector in the corpus.
+
+Each query uses the same immutable ELF, with only the fifteen-byte `cube_input` object replaced. The search code, tables, and stack layout are unchanged, and no precomputed solution is injected for individual test cases.
+
+[`measurements/rv32i-final.json`](measurements/rv32i-final.json) records more than the maximum:
+
+| Recorded data                               | Purpose                                                                |
+| ------------------------------------------- | ---------------------------------------------------------------------- |
+| `count=2644`, `gate=PASS`, `over_budget=0`  | Confirm complete coverage and the instruction-budget result            |
+| Simulator path / package / Build ID         | Identify the exact executable used for measurement                     |
+| Template / corpus / native-oracle hashes    | Prevent mixing versions when resuming collection                       |
+| Per-case index, rank, input, iret, and path | Retain every result instead of estimating the worst case from a sample |
+| Per-case ELF / raw-record hashes            | Reconstruct the input-only changes and verify the original records     |
+
+Finally, `export_gate_evidence.py` rechecks all records: the path must agree with the register nibbles, its length must be 11, independent replay must succeed, guest status must be 0, target final P/Q must be zero, and the applied count must be 11. The stack pointer, fingerprints, h, coordinates, output, and ISA must also agree.
+
+### Complete Results
+
+| Result           | Input            | Retired instructions |
+| ---------------- | ---------------- | -------------------: |
+| Minimum          | `42165373223123` |            4,799,811 |
+| Maximum          | `14325671111111` |       **38,184,348** |
+| Specified vector | `21345671111111` |       **21,411,801** |
+
+The maximum occurs at corpus index 188, rank 192,456; the minimum at index 1,351, rank 1,672,939; and the specified vector at index 528, rank 524,880.
+
+All **2,644/2,644** distance-11 states passed, with zero over-budget cases. The maximum is **11,815,652 instructions (23.63%)** below 50,000,000. This is the maximum over the complete corpus, not an extrapolation from the earlier 606-case checkpoint.
+
+The actual solution for the specified vector is:
+
+```text
+R B' D2 R' B R' B' R D2 R B
+```
+
+Total measurement elapsed time was **2,595.162 s (43 min 15 s)**, including per-query native checks, Ripes execution, and collection overhead—not simulator execution time alone.
+
+After the GUI and documentation changes, the final CLI executable remained byte-identical to the measured template. Its SHA-256 is `b412167f0e120fcdeed670a044eabfd544cca160a4d98b72e6363d66610431af`. Thus, the complete gate applies to the final renderer-off image.
+
+## 6.5 GCC Reference Comparison
+
+### What Is Being Compared
+
+The reference uses `riscv64-elf-gcc` 15.2.0 with `-O2 -march=rv32i -mabi=ilp32` to compile the query functions from `solver.c` directly. The target configuration excludes hosted builders and the oracle, while retaining the same move order, frames, pruning, heuristic, and cutoff conditions.
+
+Additional flags support a freestanding build, avoid libc builtins, PIC, and uninitialized GP addressing, disable relaxation, and enable section garbage collection. The only undefined symbol in `reference.o` is `query_tables`; no multiplication/division runtime helpers or allocator are linked.
+
+Ranking uses shifts and additions for bounded factors, move decoding uses comparisons, and the parser avoids `%7`. Two 36-byte assembly bridges unpack the C return value containing P/Q into the original `a0/a1` ABI. **Bridge costs are included in the reference size.**
+
+Both versions share the entry, replay, and output harness and measure full-entry `--iret` with the same inputs on the same pinned ISS. The six query-table payloads were compared byte for byte and found identical. The C struct includes an additional 105-byte subset-turn table to preserve its layout; this cost is not hidden.
+
+### Measured Results
+
+| Input                        | Handwritten RV32I | GCC reference |
+| ---------------------------- | ----------------: | ------------: |
+| Solved                       |               938 |         1,089 |
+| One R move                   |             1,355 |         1,505 |
+| Specified distance-11 vector |        21,411,801 |    12,797,651 |
+
+| Linked section | Handwritten RV32I | GCC reference |
+| -------------- | ----------------: | ------------: |
+| `.text`        |           1,804 B |       2,632 B |
+| `.rodata`      |          58,290 B |      58,417 B |
+| `.data`        |               0 B |           0 B |
+| `.bss`         |           1,128 B |       1,056 B |
+| Static data    |          59,418 B |      59,473 B |
+
+The handwritten `.text` is approximately **31.5% smaller**, but GCC retires approximately **40.2% fewer instructions** on the specified hard query. GCC allocates a 128-byte search frame on the stack, whereas the handwritten version uses a 64-byte ABI frame plus 72 bytes of search frames in `.bss`. This also explains the different `.bss` sizes.
+
+### Why Does GCC Win on the Hard Query?
+
+The main differences occur in the hot loop executed for each candidate, rather than in ranking, which runs only once per query:
+
+1. The handwritten implementation uses repeated addition to compute `subset * 729`. The GCC disassembly uses six fixed shift/add instructions to form `5x`, then `81x = 16 * (5x) + x`, then `729x = 9 * (81x)`.
+2. The handwritten version locates the current frame with a loop that adds 6 once per depth; GCC computes the offset with fixed shifts and additions.
+3. GCC inlines transition and heuristic lookups into the search and keeps table bases in saved registers. The handwritten version calls leaf helpers and reloads table bases.
+
+Thus, the handwritten version wins on code size and easy cases but cannot claim to retire fewer instructions in every case.
+
+The reference independently passes the 122-case matrix (27 valid / 95 invalid), 5,768 ranking records (1,732,434 iret), and 30,555 heuristic calls (1,453,562 iret). This checks that its lower instruction count does not come from weaker validation or different answers. The original compiler flags and reports are retained in the comparison records.
+
+# 7. LED Matrix Mapping
+
+## 7.1 Facelet Layout and Palette
+
+The display data has three layers: fourteen cubie bytes in `cube_state`, 24 facelet color IDs, and 32-bit RGB words in the LED Matrix. The renderer reconstructs the display from the current logical state on every frame, using this unfolded net:
+
+```text
+        U
+    L   F   R   B
+        D
+```
+
+The LED Matrix is configured to **Width 35 and Height 25**. The Ripes settings panel lists Height before Width. Each facelet occupies 4×3 pixels, each face occupies 8×6 pixels, and the slot stride is 9×7, leaving one separator. The net occupies 35×20 pixels, with two rows above it and three below it.
+
+| Face | Top-left `(x,y)` | Color  | `0xRRGGBB` |
+| ---- | ---------------- | ------ | ---------- |
+| U    | `(9,2)`          | White  | `0xFFFFFF` |
+| L    | `(0,9)`          | Orange | `0xFF9000` |
+| F    | `(9,9)`          | Green  | `0x00B050` |
+| R    | `(18,9)`         | Red    | `0xFF3030` |
+| B    | `(27,9)`         | Blue   | `0x3050FF` |
+| D    | `(9,16)`         | Yellow | `0xFFFF00` |
+
+Each frame begins by clearing all **875 words** and then drawing 24×12 = **288 pixels**. Thus, empty slots, separators, and the remaining rows stay black rather than retaining pixels from the preceding frame.
+
+## 7.2 MMIO Addressing
+
+Each LED corresponds to one word. Row-major addressing uses:
+
+$$
+\text{address}=\text{LED\_MATRIX\_0\_BASE}+4(y\cdot\text{WIDTH}+x).
+$$
+
+The code references the `LED_MATRIX_0_BASE/WIDTH/HEIGHT` symbols. The default base address of the first peripheral is `0xf0000000`. If the GUI exports different values, the symbol file should be updated before assembly instead of changing literal addresses in the renderer.
+
+Assembler expressions of the form `4 * (y * WIDTH + x)` generate the offsets of the 24 facelet origins. The multiplication takes place at assembly time; the target only needs to load an offset and add it to the base address. After writing four words in a row, the pointer has advanced by 16 B. Adding `4 * WIDTH - 16` then advances it to the next row of the same facelet.
+
+The column-major formula in the Ripes peripheral description differs from the actual implementation. This version follows `y * WIDTH + x` as used in `examples/C/leds.c` and the LED painting code.
+
+## 7.3 Updating the Display from Cubies
+
+The host geometry generator uses `+x=R`, `+y=U`, and `+z=F` to produce corner-to-facelet mappings. It also verifies that the R/B/D source and twist operations agree with the solver. The three face normals of each corner follow a consistent left-handed order, with color index `(j + orientation) mod 3`.
+
+This sum is at most four, so the target needs only one conditional subtraction. The fixed UFL corner uses identity 7 and orientation 0; the renderer must not read `p[7]` or `o[7]` from arrays containing only seven movable cubies.
+
+After parsing succeeds, the entry routine renders the initial state. For each **actual move in the returned path**, replay updates P/Q and the display's cubies. Half turns and inverse turns perform two or three quarter-turn updates but redraw only once per HTM move.
+
+The cubie update first writes to a fourteen-byte scratch buffer and then copies the result back, preventing an in-place permutation from overwriting source data that has not yet been read. Finally, in addition to requiring P/Q to be zero, the program requires the displayed state to satisfy `p[i] = i` and `o[i] = 0` before printing the solution.
+
+`RENDER=0/1` is selected at assembly time. There is no runtime branch that could bring renderer work into the CLI benchmark. The GUI's 50,000-iteration delay only slows down the display frames; its duration depends on the processor. Search and path results for the same input remain unchanged.
+
+## 7.4 Validation and Capture
+
+The CLI has no I/O peripheral, so test-only symbols redirect the framebuffer to RAM. The program still runs the real solver, replay, and renderer. Independent 3D facelet rotations produce the expected pixels, and the validator compares every word and checks guards before and after the buffer:
+
+| Input                        | Actual-path frames | RGB words checked |
+| ---------------------------- | -----------------: | ----------------: |
+| Solved                       |                  1 |               875 |
+| One R move                   |                  2 |             1,750 |
+| Specified distance-11 vector |                 12 |            10,500 |
+
+All **15 frames / 13,125 words** passed. Palette corruption was rejected. Switching from renderer-on back to renderer-off in the same directory also produced a byte-identical image, guarding against stale objects contaminating performance measurements. Production GUI builds do not contain expected-frame fixtures; the animation is not a playback of fixture data.
+
+The GUI image has **2,480 B** of `.text` and **59,670 B** of static data. Three frozen capture cases retain input/ELF hashes and expected frame counts of 1/2/12. `cube_frame_ready=0x1778` occurs after a full draw. A breakpoint can be set there; execution can step past that instruction and then run to the next frame.
+
+The following initial and solved previews were generated and verified by the current version's framebuffer validator. They are **not** Ripes GUI screenshots:
+
+![Current initial framebuffer](https://hackmd.io/_uploads/HyOA_CEizl.png)
+
+![Current solved framebuffer](https://hackmd.io/_uploads/Hk-JFR4ifx.png)
+
+The renderer-enabled `smoke.elf` was also loaded into the Ripes GUI and run on the specified distance-11 case. The program printed the complete 11-move solution, the LED Matrix displayed the solved cube, and execution terminated normally with exit code 0. Per-frame pixel correctness is supported separately by the RAM framebuffer validation above.
+
+![Current distance-11 solved GUI](https://hackmd.io/_uploads/SJFxMJHize.png)
+
+# 8. Pipeline Walkthrough
+
+## 8.1 Current Store/Load Trace
+
+`walkthrough.S` first sets `t1=10` and `t0=0x1050`, then executes:
+
+```asm
+addi t2, t1, 4
+sw   t2, 0(t0)
+lw   s1, 0(t0)
+add  s2, s1, t2
+```
+
+SW is at address `0x1018`, LW at `0x101c`, and ADD at `0x1020`. The memory word is set to 14, LW reads `s1=14`, and ADD produces `s2=28`. The program compares these results and returns status 0.
+
+On `RV32_5S`, the run takes **16 iret / 23 cycles / CPI 1.4375**. ISS reports 17 iret, one more due to a post-exit self-loop instruction; this is not an extra search move.
+
+| Stage | Work                                                                   |
+| ----- | ---------------------------------------------------------------------- |
+| IF    | Fetch the instruction at the PC                                        |
+| ID    | Decode, read registers, and generate immediates and control signals    |
+| EX    | Select or forward operands; calculate the ALU result or memory address |
+| MEM   | Perform memory reads or writes                                         |
+| WB    | Select the result and write the destination register                   |
+
+The measured stage history is:
+
+| Instruction   |  IF |  ID |  EX | MEM |  WB |
+| ------------- | --: | --: | --: | --: | --: |
+| SW            |   6 |   7 |   8 |   9 |  10 |
+| LW            |   7 |   8 |   9 |  10 |  11 |
+| Dependent ADD |   8 |   9 |  11 |  12 |  13 |
+
+ADD encounters a load-use stall at cycle 10. The hazard unit stalls the front end and inserts a bubble in ID/EX. In cycle 11, the load data is available through WB forwarding, allowing ADD to enter EX. These stages and the stall come from the actual `--pipeline` history, not an idealized schedule.
+
+## 8.2 Which Instruction Owns Each Control Signal?
+
+In the `RV32_5S` wiring, `registerFile->wr_en` comes from MEM/WB, whereas `data_mem->wr_en` comes from EX/MEM. `reg_wr_src` selects the ALU result, memory read, or PC+4. The ALU operand multiplexers select REG1/PC and REG2/IMM.
+
+| Cycle | Interpretation in the implementation                                                                                                                     |
+| ----: | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+|     9 | SW is in MEM: address=`0x1050`, data=14, and memory write enabled. The register-file write at the same time belongs to an earlier ADDI in WB, not to SW. |
+|    10 | SW reaches WB without writing a destination register; LW reads the same memory word in MEM.                                                              |
+|    11 | LW writes x9=14 in WB using MEMREAD; dependent ADD uses the forwarded result in EX.                                                                      |
+
+Therefore, not every highlighted wire in a screenshot belongs to the selected instruction. Any explanation of a register-write, memory-write, or mux signal must first identify the stage controlling it.
+
+The same datapath is used by the solver: `lhu` reads an unsigned halfword from `row_base + 2 * coordinate`; `sh` stores child P/Q at offsets 0/2 of `cube_frames + 6 * depth`; and the renderer uses `sw` to write RGB words to MMIO. A store has no destination-register writeback.
+
+## 8.3 Observations from Reference Screenshots
+
+Screenshots from the completed reference implementation illustrate the following wire and memory behavior. **These values belong to the reference session and are not addresses from the current ELF**:
+
+- **Coordinate LHU:** IF895 → ID896 → EX897 → MEM898 → WB899. The MEM address is `0x1000096e`, the read data is `0x00000cde`, and write enable is inactive. Base `0x100000ce` plus `2 * 1104 = 0x8a0` gives that address, and the returned P' is 3294.
+- **Frame SH:** At cycle 1823, the MEM address is `0x10000018`, data is `0x00000396`, and write enable is active. The Memory viewer bytes `0x96,0x03` reconstruct halfword 918. The reference uses a separate P array, so its offset is `2 * depth`; this cannot be substituted for the current version's six-byte frame layout.
+- **Concurrent AUIPC in EX:** PC=`0x13c` and upper immediate=`0x10000000` produce `0x1000013c`, illustrating the PC/IMM ALU mux paths. These operands do not belong to the SH in MEM.
+
+The register-write enable visible in the stage-history screenshot at cycle 903 belongs to the `addi x28,x28,-1` then in WB, not to the earlier LHU's WB wiring. IF/ID/WB cycles for the store that were not recorded are not guessed.
+
+![Reference LHU stage history](https://hackmd.io/_uploads/r1vm_R4szg.png)
+
+![Reference SH and concurrent AUIPC](https://hackmd.io/_uploads/H1S4OAVjfe.png)
+
+## 8.4 Branching vs. Branchless Modulo-3
+
+The renderer's `orientation + twist` or `j + orientation` is at most four, so it can be reduced using:
+
+```asm
+addi t4, t2, -3
+bltz t4, keep_sum
+mv   t2, t4
+```
+
+The branching version executes two instructions when the sum is below 3, and three otherwise. The branchless version uses subtraction, sign extraction, a mask, and an add-back, taking four instructions in every case. Both variants were tested with the same harness over all nine `0..2` operand pairs:
+
+| Variant    | ISS iret | RV32_5S iret | RV32_5S cycles |    CPI |
+| ---------- | -------: | -----------: | -------------: | -----: |
+| Branching  |      124 |          123 |            177 | 1.4390 |
+| Branchless |      139 |          138 |            180 | 1.3043 |
+
+Six pairs require no reduction and three require reduction. Thus, the branching reduction uses `6 * 2 + 3 * 3 = 21` instructions, versus `9 * 4 = 36` for the branchless version—a difference of 15. Six taken reduction branches on the 5S add twelve flush cycles. Even after accounting for these cycles, branching takes three fewer cycles overall, consistent with the measurements.
+
+**Lower CPI does not necessarily mean faster execution.** Branchless has lower CPI on this workload but takes more total cycles. CPI alone cannot establish performance, nor can removing a branch be assumed to improve it. Raw JSON/TSV histories retain the complete trace for verification.
+
+# 9. Optimization and Development Summary
+
+The assembly was integrated through independently verifiable checkpoints rather than implemented in one step and judged only by its final output:
+
+| Checkpoint             | Implementation focus                                                       | Validation focus                                     |
+| ---------------------- | -------------------------------------------------------------------------- | ---------------------------------------------------- |
+| A1 Tables / entry      | Host table export, linker image starting at `0x1000`, stack and ELF layout | Table payload / four R turns return to solved        |
+| A2 Parser              | Unsigned range check, seen mask, fourteen-byte output                      | 122 input cases                                      |
+| A3 Ranking             | Repeated addition for P, shift/add for Q, `a0/a1` ABI                      | Complete P/Q domains                                 |
+| A4 Heuristic           | Byte tables, mixed index, nibble extraction                                | All mixed entries                                    |
+| A5 Search              | Saved registers, 64 B ABI frame, six-byte search frames                    | Comparison with C solution length and path replay    |
+| A6 Replay / output     | Target validation, four-byte token slots, exit self-loop                   | Invalid paths / output negative controls             |
+| Measurements / display | Frozen images, GCC reference, RGB checks, pipeline traces                  | Complete hardest-state gate and implementation costs |
+
+The main remaining costs are repeated addition for `subset * 729` and the `depth * 6` frame-location loop inside the hot path. The GCC comparison shows that improving these two operations is more valuable than optimizing the one-time input ranking. However, an unimplemented shift/add alternative must not be presented as a measured speedup.
+
+Another result is that branchless modulo reduces CPI but increases total cycles. Both negative results are retained to provide measured evidence for future revisions.
+
+The code is available under [`riscv/`](riscv/). The complete gate export preserves all 2,644 counts and paths, with evidence frozen in commit `8142ddc`. The figures in this document are not performance results taken from another reference worktree.
+
+# 10. Conclusion
+
+This implementation uses P/Q coordinates, an admissible heuristic, and explicit-frame IDA* to return optimal HTM solutions without heap allocation, recursion, or the M extension.
+
+Final CLI static data is **59,418 B**, satisfying the 128 KiB limit. All **2,644 distance-11 states** pass the 50-million-instruction gate; the maximum is **38,184,348** retired instructions, and the specified vector takes **21,411,801**.
+
+The LED renderer follows the actual solution path, and the pipeline discussion is supported by measured stage histories and labeled reference screenshots. The GCC comparison still reveals room for improvement in the handwritten baseline, but correctness, the memory limit, and the complete hardest-state instruction budget are supported by collected evidence.
